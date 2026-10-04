@@ -17,6 +17,13 @@ authors.workspace = true
 name = "amdgpu_top_win"
 path = "src/main.rs"
 
+[features]
+default = []
+# ADLX sensor backend (temperature/clock/fan/power/VRAM usage).
+# Requires a local clone of GPUOpen-LibrariesAndSDKs/ADLX next to this repo
+# (../../../ADLX relative to this crate) and the AMD driver's amdadlx64.dll.
+adlx = ["dep:amd-adlx"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,3 +35,4 @@ windows = { version = "0.61", features = [
     "Win32_System_Performance",
     "Win32_System_Diagnostics_ToolHelp",
 ] }
+amd-adlx = { path = "../../../ADLX/Samples/rust/amd-adlx", optional = true }

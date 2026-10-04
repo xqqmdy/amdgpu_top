@@ -16,11 +16,40 @@ mod dxgi;
 mod pdh;
 mod proc;
 
+#[cfg(feature = "adlx")]
+mod adlx;
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
 pub use dxgi::WinGpuAdapter;
+
+/// hwmon-equivalent sensor data (ADLX backend, `adlx` feature).
+/// All fields None when unsupported by driver/GPU.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct SensorSnapshot {
+    /// ADLX GPUUsage, %
+    pub gpu_usage: Option<f64>,
+    /// SCLK
+    pub gpu_clock_mhz: Option<f64>,
+    /// MCLK
+    pub vram_clock_mhz: Option<f64>,
+    /// ≈ hwmon temp1 (edge)
+    pub temp_edge_c: Option<f64>,
+    /// ≈ hwmon junction (hotspot)
+    pub temp_hotspot_c: Option<f64>,
+    pub temp_intake_c: Option<f64>,
+    /// ≈ hwmon fan1_input
+    pub fan_rpm: Option<f64>,
+    /// ≈ hwmon power1_average (chip power; unsupported on some ASICs)
+    pub power_w: Option<f64>,
+    /// ≈ hwmon power1_input (board power)
+    pub total_board_power_w: Option<f64>,
+    pub voltage_mv: Option<f64>,
+    /// ADLX GPUVRAM, MB
+    pub vram_used_mb: Option<f64>,
+}
 
 /// Per-engine utilization of one process, in %.
 /// Field names align with amdgpu_top's `FdInfoUsage` engine fields.
@@ -87,12 +116,17 @@ pub struct AdapterSnapshot {
     /// sum of per-process dedicated bytes
     pub dedicated_used_bytes: u64,
     pub shared_used_bytes: u64,
+    /// ADLX sensors when the `adlx` feature is enabled and the driver provides them
+    #[cfg(feature = "adlx")]
+    pub sensors: Option<SensorSnapshot>,
 }
 
 pub struct Sampler {
     adapters: Vec<WinGpuAdapter>,
     pdh: pdh::GpuPdhQuery,
     collected_once: bool,
+    #[cfg(feature = "adlx")]
+    adlx: Option<adlx::AdlxSensors>,
 }
 
 pub struct SnapshotArgs {
@@ -101,10 +135,15 @@ pub struct SnapshotArgs {
 
 impl Sampler {
     pub fn new() -> windows::core::Result<Self> {
+        #[cfg(feature = "adlx")]
+        let adlx = adlx::AdlxSensors::new();
+
         Ok(Self {
             adapters: dxgi::enumerate_amd_adapters()?,
             pdh: pdh::GpuPdhQuery::new()?,
             collected_once: false,
+            #[cfg(feature = "adlx")]
+            adlx,
         })
     }
 
@@ -129,6 +168,12 @@ impl Sampler {
             Err(_) => (Vec::new(), Vec::new()),
         };
         self.collected_once = true;
+
+        #[cfg(feature = "adlx")]
+        let adlx_snap: Vec<crate::SensorSnapshot> = self.adlx
+            .as_mut()
+            .map(|a| a.snapshot())
+            .unwrap_or_default();
 
         let mut proc_names = proc::get_process_names();
 
@@ -162,7 +207,8 @@ impl Sampler {
 
         self.adapters
             .iter()
-            .map(|a| {
+            .enumerate()
+            .map(|(idx, a)| {
                 let key = (a.luid_low, a.luid_high as u32);
                 let pids = per_adapter.get(&key).cloned().unwrap_or_default();
                 let mut processes: Vec<ProcGpuUsage> = pids
@@ -207,6 +253,8 @@ impl Sampler {
                     total_usage,
                     dedicated_used_bytes: dedicated_used,
                     shared_used_bytes: shared_used,
+                    #[cfg(feature = "adlx")]
+                    sensors: adlx_snap.get(idx).cloned(),
                 }
             })
             .collect()

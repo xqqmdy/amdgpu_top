@@ -118,6 +118,27 @@ fn render_table(out: &mut impl Write, snapshot: &[AdapterSnapshot], interval_ms:
             t.gfx, t.compute, t.dma, t.dec, t.enc, t.media
         )?;
 
+        #[cfg(feature = "adlx")]
+        if let Some(s) = &dev.sensors {
+            let opt = |v: Option<f64>| match v {
+                Some(v) => format!("{v:>6.1}"),
+                None => "     -".to_string(),
+            };
+            writeln!(
+                out,
+                "  SNSR  usage {}%  clk {} MHz  memclk {} MHz  temp {} C  hot {} C  fan {} RPM  board {} W  volt {} mV  vram {} MB",
+                opt(s.gpu_usage),
+                opt(s.gpu_clock_mhz),
+                opt(s.vram_clock_mhz),
+                opt(s.temp_edge_c),
+                opt(s.temp_hotspot_c),
+                opt(s.fan_rpm),
+                opt(s.total_board_power_w),
+                opt(s.voltage_mv),
+                opt(s.vram_used_mb),
+            )?;
+        }
+
         let rows: Vec<&ProcGpuUsage> = dev
             .processes
             .iter()
