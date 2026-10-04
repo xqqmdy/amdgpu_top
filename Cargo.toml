@@ -39,6 +39,7 @@ members = [
     "crates/amdgpu_top_tui",
     "crates/amdgpu_top_gui",
     "crates/amdgpu_top_json",
+    "crates/libamdgpu_top_windows",
 ]
 
 [workspace.package]
