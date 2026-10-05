@@ -32,7 +32,9 @@ struct AdlxGpu {
 }
 
 fn cstr_ptr_to_string(p: *const std::os::raw::c_char) -> String {
-    if p.is_null() { return String::new(); }
+    if p.is_null() {
+        return String::new();
+    }
     unsafe { std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned() }
 }
 
@@ -72,8 +74,7 @@ impl AdlxSensors {
                 // PCI device id (hex string) for DXGI matching.
                 let mut dev_cstr: *const std::os::raw::c_char = std::ptr::null();
                 let device_id = if adlx_succeeded(((*(*gpu).pVtbl).DeviceId)(gpu, &mut dev_cstr)) {
-                    u32::from_str_radix(&cstr_ptr_to_string(dev_cstr), 16)
-                        .unwrap_or(u32::MAX)
+                    u32::from_str_radix(&cstr_ptr_to_string(dev_cstr), 16).unwrap_or(u32::MAX)
                 } else {
                     u32::MAX
                 };
@@ -81,7 +82,11 @@ impl AdlxSensors {
                 let mut support: *mut IADLXGPUMetricsSupport = std::ptr::null_mut();
                 if adlx_succeeded((perf_vtbl.GetSupportedGPUMetrics)(perf, gpu, &mut support)) {
                     // Hold the At() reference for our lifetime (released in Drop).
-                    out.push(AdlxGpu { gpu, support, device_id });
+                    out.push(AdlxGpu {
+                        gpu,
+                        support,
+                        device_id,
+                    });
                 } else {
                     ((*(*gpu).pVtbl).Release)(gpu);
                 }
@@ -94,7 +99,11 @@ impl AdlxSensors {
                 return None;
             }
 
-            Some(Self { _helper: helper, perf, gpus: out })
+            Some(Self {
+                _helper: helper,
+                perf,
+                gpus: out,
+            })
         }
     }
 
@@ -112,7 +121,11 @@ impl AdlxSensors {
 
             for g in &self.gpus {
                 let mut metrics: *mut IADLXGPUMetrics = std::ptr::null_mut();
-                if !adlx_succeeded((perf_vtbl.GetCurrentGPUMetrics)(self.perf, g.gpu, &mut metrics)) {
+                if !adlx_succeeded((perf_vtbl.GetCurrentGPUMetrics)(
+                    self.perf,
+                    g.gpu,
+                    &mut metrics,
+                )) {
                     continue;
                 }
 
@@ -136,13 +149,43 @@ impl AdlxSensors {
                 }
 
                 read!(IsSupportedGPUUsage, GPUUsage, adlx_double, gpu_usage);
-                read!(IsSupportedGPUClockSpeed, GPUClockSpeed, adlx_int, gpu_clock_mhz);
-                read!(IsSupportedGPUVRAMClockSpeed, GPUVRAMClockSpeed, adlx_int, vram_clock_mhz);
-                read!(IsSupportedGPUTemperature, GPUTemperature, adlx_double, temp_edge_c);
-                read!(IsSupportedGPUHotspotTemperature, GPUHotspotTemperature, adlx_double, temp_hotspot_c);
-                read!(IsSupportedGPUIntakeTemperature, GPUIntakeTemperature, adlx_double, temp_intake_c);
+                read!(
+                    IsSupportedGPUClockSpeed,
+                    GPUClockSpeed,
+                    adlx_int,
+                    gpu_clock_mhz
+                );
+                read!(
+                    IsSupportedGPUVRAMClockSpeed,
+                    GPUVRAMClockSpeed,
+                    adlx_int,
+                    vram_clock_mhz
+                );
+                read!(
+                    IsSupportedGPUTemperature,
+                    GPUTemperature,
+                    adlx_double,
+                    temp_edge_c
+                );
+                read!(
+                    IsSupportedGPUHotspotTemperature,
+                    GPUHotspotTemperature,
+                    adlx_double,
+                    temp_hotspot_c
+                );
+                read!(
+                    IsSupportedGPUIntakeTemperature,
+                    GPUIntakeTemperature,
+                    adlx_double,
+                    temp_intake_c
+                );
                 read!(IsSupportedGPUPower, GPUPower, adlx_double, power_w);
-                read!(IsSupportedGPUTotalBoardPower, GPUTotalBoardPower, adlx_double, total_board_power_w);
+                read!(
+                    IsSupportedGPUTotalBoardPower,
+                    GPUTotalBoardPower,
+                    adlx_double,
+                    total_board_power_w
+                );
                 read!(IsSupportedGPUFanSpeed, GPUFanSpeed, adlx_int, fan_rpm);
                 read!(IsSupportedGPUVRAM, GPUVRAM, adlx_int, vram_used_mb);
                 read!(IsSupportedGPUVoltage, GPUVoltage, adlx_int, voltage_mv);

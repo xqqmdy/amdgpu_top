@@ -9,7 +9,7 @@
 //! VideoProcessing (also Crypto/Photo/... mapped to `other` upstream).
 
 use std::collections::HashMap;
-use windows::core::{Error as WinError, w};
+use windows::core::{w, Error as WinError};
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW,
     PdhOpenQueryW, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
@@ -40,7 +40,9 @@ pub struct ProcMemSample {
 }
 
 /// u32 PDH status code: 0 == ERROR_SUCCESS
-fn ok(status: u32) -> bool { status == 0 }
+fn ok(status: u32) -> bool {
+    status == 0
+}
 
 /// Parse `pid_<n>_luid_0x<h>_0x<l>...` tail segments.
 fn parse_instance(name: &str) -> (u32, Option<(u32, u32)>) {
@@ -61,8 +63,8 @@ fn parse_instance(name: &str) -> (u32, Option<(u32, u32)>) {
                         luid = Some((l, h)); // (low, high)
                     }
                 }
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
 
@@ -84,11 +86,21 @@ fn read_counter_array(counter: PDH_HCOUNTER) -> Result<Vec<(String, i64)>, u32> 
 
     // First call: probe size.
     let status = unsafe {
-        PdhGetFormattedCounterArrayW(counter, PDH_FMT_LARGE, &mut buffer_size, &mut item_count, None)
+        PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_LARGE,
+            &mut buffer_size,
+            &mut item_count,
+            None,
+        )
     };
     if status != PDH_MORE_DATA {
         // No instances (empty) or genuine error.
-        return if ok(status) { Ok(Vec::new()) } else { Err(status) };
+        return if ok(status) {
+            Ok(Vec::new())
+        } else {
+            Err(status)
+        };
     }
 
     let mut buffer = vec![0u8; buffer_size as usize];
@@ -106,16 +118,17 @@ fn read_counter_array(counter: PDH_HCOUNTER) -> Result<Vec<(String, i64)>, u32> 
     }
 
     let items = unsafe {
-        std::slice::from_raw_parts(buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, item_count as usize)
+        std::slice::from_raw_parts(
+            buffer.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W,
+            item_count as usize,
+        )
     };
 
     Ok(items
         .iter()
         .filter(|it| it.FmtValue.CStatus == 0)
         .map(|it| {
-            let name = unsafe {
-                it.szName.to_string().unwrap_or_default()
-            };
+            let name = unsafe { it.szName.to_string().unwrap_or_default() };
             let value = unsafe { it.FmtValue.Anonymous.largeValue };
             (name, value)
         })
@@ -156,7 +169,9 @@ impl GpuPdhQuery {
         let mut query = PDH_HQUERY::default();
 
         if !ok(unsafe { PdhOpenQueryW(None, 0, &mut query) }) {
-            return Err(WinError::from_hresult(windows::core::HRESULT::from_win32(1)));
+            return Err(WinError::from_hresult(windows::core::HRESULT::from_win32(
+                1,
+            )));
         }
 
         let mut engine_counter = PDH_HCOUNTER::default();
@@ -170,17 +185,45 @@ impl GpuPdhQuery {
 
         let mut fail = 0;
         if !ok(unsafe {
-            PdhAddEnglishCounterW(query, w!(r"\GPU Engine(*)\Utilization Percentage"), 0, &mut engine_counter)
-        }) { fail = 2; }
+            PdhAddEnglishCounterW(
+                query,
+                w!(r"\GPU Engine(*)\Utilization Percentage"),
+                0,
+                &mut engine_counter,
+            )
+        }) {
+            fail = 2;
+        }
         if !ok(unsafe {
-            PdhAddEnglishCounterW(query, w!(r"\GPU Process Memory(*)\Dedicated Usage"), 0, &mut proc_mem_dedicated)
-        }) { fail = 3; }
+            PdhAddEnglishCounterW(
+                query,
+                w!(r"\GPU Process Memory(*)\Dedicated Usage"),
+                0,
+                &mut proc_mem_dedicated,
+            )
+        }) {
+            fail = 3;
+        }
         if !ok(unsafe {
-            PdhAddEnglishCounterW(query, w!(r"\GPU Process Memory(*)\Shared Usage"), 0, &mut proc_mem_shared)
-        }) { fail = 4; }
+            PdhAddEnglishCounterW(
+                query,
+                w!(r"\GPU Process Memory(*)\Shared Usage"),
+                0,
+                &mut proc_mem_shared,
+            )
+        }) {
+            fail = 4;
+        }
         if !ok(unsafe {
-            PdhAddEnglishCounterW(query, w!(r"\GPU Process Memory(*)\Local Usage"), 0, &mut proc_mem_local)
-        }) { fail = 5; }
+            PdhAddEnglishCounterW(
+                query,
+                w!(r"\GPU Process Memory(*)\Local Usage"),
+                0,
+                &mut proc_mem_local,
+            )
+        }) {
+            fail = 5;
+        }
         if !ok(unsafe {
             PdhAddEnglishCounterW(query, w!(r"\GPU Process Memory(*)\Non Local Usage"), 0, &mut proc_mem_non_local)
         }) { fail = 6; }
@@ -196,7 +239,9 @@ impl GpuPdhQuery {
 
         if fail != 0 {
             unsafe { PdhCloseQuery(query) };
-            return Err(WinError::from_hresult(windows::core::HRESULT::from_win32(fail)));
+            return Err(WinError::from_hresult(windows::core::HRESULT::from_win32(
+                fail,
+            )));
         }
 
         Ok(Self {
@@ -227,39 +272,50 @@ impl GpuPdhQuery {
         for (name, v) in read_counter_array(self.engine_counter)? {
             let (pid, luid) = parse_instance(&name);
             let engtype = engtype_of(&name);
-            let e = collapsed.entry((pid, engtype.clone())).or_insert(EngineSample {
-                pid,
-                luid,
-                engtype,
-                utilization: 0.0,
-            });
+            let e = collapsed
+                .entry((pid, engtype.clone()))
+                .or_insert(EngineSample {
+                    pid,
+                    luid,
+                    engtype,
+                    utilization: 0.0,
+                });
             e.utilization += v as f64;
-            if e.luid.is_none() { e.luid = luid; }
+            if e.luid.is_none() {
+                e.luid = luid;
+            }
         }
         let engines = collapsed.into_values().collect();
 
         // GPU Process Memory (all instant counters, bytes)
         let mut per_pid: HashMap<u32, ProcMemSample> = HashMap::new();
-        let mut feed = |counter: PDH_HCOUNTER, put: &dyn Fn(&mut ProcMemSample, u64)| -> Result<(), u32> {
-            for (name, v) in read_counter_array(counter)? {
-                let (pid, luid) = parse_instance(&name);
-                let e = per_pid.entry(pid).or_insert_with(|| ProcMemSample {
-                    pid,
-                    luid,
-                    dedicated_commit_bytes: 0,
-                    shared_commit_bytes: 0,
-                    local_resident_bytes: 0,
-                    non_local_resident_bytes: 0,
-                });
-                put(e, v as u64);
-                if e.luid.is_none() { e.luid = luid; }
-            }
-            Ok(())
-        };
+        let mut feed =
+            |counter: PDH_HCOUNTER, put: &dyn Fn(&mut ProcMemSample, u64)| -> Result<(), u32> {
+                for (name, v) in read_counter_array(counter)? {
+                    let (pid, luid) = parse_instance(&name);
+                    let e = per_pid.entry(pid).or_insert_with(|| ProcMemSample {
+                        pid,
+                        luid,
+                        dedicated_commit_bytes: 0,
+                        shared_commit_bytes: 0,
+                        local_resident_bytes: 0,
+                        non_local_resident_bytes: 0,
+                    });
+                    put(e, v as u64);
+                    if e.luid.is_none() {
+                        e.luid = luid;
+                    }
+                }
+                Ok(())
+            };
 
         feed(self.proc_mem_local, &|e, v| e.local_resident_bytes = v)?;
-        feed(self.proc_mem_non_local, &|e, v| e.non_local_resident_bytes = v)?;
-        feed(self.proc_mem_dedicated, &|e, v| e.dedicated_commit_bytes = v)?;
+        feed(self.proc_mem_non_local, &|e, v| {
+            e.non_local_resident_bytes = v
+        })?;
+        feed(self.proc_mem_dedicated, &|e, v| {
+            e.dedicated_commit_bytes = v
+        })?;
         feed(self.proc_mem_shared, &|e, v| e.shared_commit_bytes = v)?;
 
         let proc_mem: Vec<ProcMemSample> = per_pid.into_values().collect();

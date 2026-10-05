@@ -19,11 +19,17 @@ mod proc;
 #[cfg(feature = "adlx")]
 mod adlx;
 
+#[cfg(feature = "gpa")]
+pub mod gpa;
+
 use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Duration;
 
 pub use dxgi::WinGpuAdapter;
+
+#[cfg(feature = "gpa")]
+pub use dxgi::first_amd_adapter_handle as dxgi_first_amd_adapter_handle;
 
 /// hwmon-equivalent sensor data (ADLX backend, `adlx` feature).
 /// All fields None when unsupported by driver/GPU.
@@ -94,7 +100,7 @@ impl EngineUsage {
 pub struct ProcGpuUsage {
     pub pid: u32,
     pub name: String,
-    pub usage: EngineUsage,       // %
+    pub usage: EngineUsage, // %
     /// resident local VRAM, bytes ≈ drm-resident-vram — the "real" footprint;
     /// evictable driver buffers (ReLive replay) stay out of this
     pub vram_resident_bytes: u64,
@@ -188,10 +194,8 @@ impl Sampler {
             adapter_mem.iter().map(|a| (a.luid, a)).collect();
 
         #[cfg(feature = "adlx")]
-        let adlx_snap: Vec<crate::SensorSnapshot> = self.adlx
-            .as_mut()
-            .map(|a| a.snapshot())
-            .unwrap_or_default();
+        let adlx_snap: Vec<crate::SensorSnapshot> =
+            self.adlx.as_mut().map(|a| a.snapshot()).unwrap_or_default();
 
         let mut proc_names = proc::get_process_names();
 
@@ -200,24 +204,44 @@ impl Sampler {
         let mut per_adapter: HashMap<(u32, u32), PidMap> = HashMap::new();
         let mut luid_of_pid: HashMap<u32, (u32, u32)> = HashMap::new();
 
-        for pdh::EngineSample { pid, luid, engtype, utilization } in engines {
+        for pdh::EngineSample {
+            pid,
+            luid,
+            engtype,
+            utilization,
+        } in engines
+        {
             let Some(luid) = luid else { continue };
             let entry = per_adapter
                 .entry(luid)
                 .or_default()
                 .entry(pid)
-                .or_insert_with(|| ProcGpuUsage { pid, ..Default::default() });
+                .or_insert_with(|| ProcGpuUsage {
+                    pid,
+                    ..Default::default()
+                });
             entry.usage.add(&engtype, utilization);
             luid_of_pid.insert(pid, luid);
         }
 
-        for pdh::ProcMemSample { pid, luid, dedicated_commit_bytes, shared_commit_bytes, local_resident_bytes, non_local_resident_bytes } in proc_mem {
+        for pdh::ProcMemSample {
+            pid,
+            luid,
+            dedicated_commit_bytes,
+            shared_commit_bytes,
+            local_resident_bytes,
+            non_local_resident_bytes,
+        } in proc_mem
+        {
             let Some(luid) = luid else { continue };
             let entry = per_adapter
                 .entry(luid)
                 .or_default()
                 .entry(pid)
-                .or_insert_with(|| ProcGpuUsage { pid, ..Default::default() });
+                .or_insert_with(|| ProcGpuUsage {
+                    pid,
+                    ..Default::default()
+                });
             entry.vram_commit_bytes = dedicated_commit_bytes;
             entry.shared_commit_bytes = shared_commit_bytes;
             entry.vram_resident_bytes = local_resident_bytes;
@@ -240,13 +264,17 @@ impl Sampler {
                     .filter(|p| args.filter_pid.is_none_or(|pid| pid == p.pid))
                     .map(|mut p| {
                         if p.name.is_empty() {
-                            p.name = proc_names.remove(&p.pid).unwrap_or_else(|| "<unknown>".into());
+                            p.name = proc_names
+                                .remove(&p.pid)
+                                .unwrap_or_else(|| "<unknown>".into());
                         }
                         p
                     })
                     .collect();
                 processes.sort_by(|a, b| {
-                    b.usage.total().partial_cmp(&a.usage.total())
+                    b.usage
+                        .total()
+                        .partial_cmp(&a.usage.total())
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then(b.vram_resident_bytes.cmp(&a.vram_resident_bytes))
                 });

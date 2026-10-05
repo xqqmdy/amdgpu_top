@@ -23,6 +23,8 @@ fn main() {
     let mut show_all = false;
     let mut interval_ms: u64 = 1000;
     let mut filter_pid: Option<u32> = None;
+    #[cfg(feature = "gpa")]
+    let mut spm = false;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -30,13 +32,24 @@ fn main() {
             "-J" | "--json" => json = true,
             "--once" => once = true,
             "-a" | "--all" => show_all = true,
-            "-u" | "--update-ms" => interval_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(1000),
+            #[cfg(feature = "gpa")]
+            "--spm" => spm = true,
+            "-u" | "--update-ms" => {
+                interval_ms = it.next().and_then(|v| v.parse().ok()).unwrap_or(1000)
+            }
             "-p" | "--pid" => filter_pid = it.next().and_then(|v| v.parse().ok()),
             "-h" | "--help" => {
-                println!("amdgpu_top_win [-J|--json] [--once] [-a|--all] [-u <ms>] [-p <pid>]");
+                println!(
+                    "amdgpu_top_win [-J|--json] [--once] [-a|--all] [-u <ms>] [-p <pid>]{}",
+                    if cfg!(feature = "gpa") {
+                        " [--spm]"
+                    } else {
+                        ""
+                    }
+                );
                 return;
-            },
-            _ => {},
+            }
+            _ => {}
         }
     }
 
@@ -46,10 +59,15 @@ fn main() {
         Err(e) => {
             eprintln!("Failed to init DXGI/PDH: {e}");
             std::process::exit(1);
-        },
+        }
     };
 
     let snap_args = SnapshotArgs { filter_pid };
+
+    #[cfg(feature = "gpa")]
+    if spm {
+        return spm_main(interval_ms);
+    }
 
     // Prime PDH rate counters (utilization needs 2 samples spaced in time).
     sampler.prime();
@@ -90,12 +108,20 @@ fn mib(kib: u64) -> String {
     format!("{:.1}", kib as f64 / 1024.0)
 }
 
-fn render_table(out: &mut impl Write, snapshot: &[AdapterSnapshot], interval_ms: u64, show_all: bool) -> io::Result<()> {
+fn render_table(
+    out: &mut impl Write,
+    snapshot: &[AdapterSnapshot],
+    interval_ms: u64,
+    show_all: bool,
+) -> io::Result<()> {
     if snapshot.is_empty() {
         return writeln!(out, "No AMD GPU (vendor 0x1002) found via DXGI.");
     }
 
-    writeln!(out, "amdgpu_top_win (DXGI + PDH backend)   update: {interval_ms} ms")?;
+    writeln!(
+        out,
+        "amdgpu_top_win (DXGI + PDH backend)   update: {interval_ms} ms"
+    )?;
     writeln!(out)?;
 
     for dev in snapshot {
@@ -153,7 +179,17 @@ fn render_table(out: &mut impl Write, snapshot: &[AdapterSnapshot], interval_ms:
         writeln!(
             out,
             "  {:>7}  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>10} {:>10} {:>10}",
-            "PID", "NAME", "GFX%", "COMP%", "COPY%", "DEC%", "ENC%", "VPP%", "VRAM(MiB)", "COMMIT(MiB)", "SHR(MiB)"
+            "PID",
+            "NAME",
+            "GFX%",
+            "COMP%",
+            "COPY%",
+            "DEC%",
+            "ENC%",
+            "VPP%",
+            "VRAM(MiB)",
+            "COMMIT(MiB)",
+            "SHR(MiB)"
         )?;
         for p in rows {
             let u = &p.usage;
@@ -175,5 +211,66 @@ fn render_table(out: &mut impl Write, snapshot: &[AdapterSnapshot], interval_ms:
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { s.to_string() } else { s.chars().take(max - 1).collect::<String>() + "…" }
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max - 1).collect::<String>() + "…"
+    }
+}
+
+/// SPM mode: hardware counter sampling via GPUPerfAPI (GRBM-class IP busy).
+#[cfg(feature = "gpa")]
+fn spm_main(interval_ms: u64) {
+    use libamdgpu_top_windows::gpa::{SpmSampler, BUSY_COUNTERS};
+
+    let names: Vec<String> = BUSY_COUNTERS.iter().map(|s| s.to_string()).collect();
+
+    let mut sampler = match SpmSampler::new(
+        libamdgpu_top_windows::dxgi_first_amd_adapter_handle().expect("no AMD adapter"),
+        4096,
+        &names,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("SPM init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let preview = sampler.list_counters(12);
+    eprintln!("[gpa] first public counters: {preview:?}");
+
+    // Warm-up round (driver lazily creates SPM resources on first use).
+    let _ = sampler.collect();
+
+    loop {
+        let start = Instant::now();
+        match sampler.collect(20_000) {
+            Ok(counters) if !counters.is_empty() => {
+                println!("{CSI_CLEAR}");
+                println!("SPM hardware counters (GPUPerfAPI)  window ~{interval_ms} ms");
+                println!();
+                println!(
+                    "  {:<26} {:>12} {:>12} {:>8}",
+                    "COUNTER", "MEAN", "LAST", "SAMPLES"
+                );
+                for c in &counters {
+                    println!(
+                        "  {:<26} {:>12.2} {:>12.2} {:>8}",
+                        c.name, c.mean, c.last, c.samples
+                    );
+                }
+            }
+            Ok(_) => eprintln!("[gpa] no SPM data (GPU idle? try a GPU workload)"),
+            Err(e) => {
+                eprintln!("SPM collect failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        let elapsed = start.elapsed();
+        let interval = Duration::from_millis(interval_ms.max(50));
+        if elapsed < interval {
+            std::thread::sleep(interval - elapsed);
+        }
+    }
 }

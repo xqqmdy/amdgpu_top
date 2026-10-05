@@ -19,7 +19,11 @@ pub fn get_process_names() -> HashMap<u32, String> {
 
     if unsafe { Process32FirstW(snap, &mut entry) }.is_ok() {
         loop {
-            let len = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            let len = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
             out.insert(
                 entry.th32ProcessID,
                 String::from_utf16_lossy(&entry.szExeFile[..len]),

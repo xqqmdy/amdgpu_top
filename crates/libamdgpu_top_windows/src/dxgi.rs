@@ -1,6 +1,8 @@
 //! DXGI adapter enumeration (equivalent of amdgpu_top's `DevicePath::get_device_path_list`).
 
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE,
+};
 
 pub struct WinGpuAdapter {
     pub description: String,
@@ -23,13 +25,35 @@ pub fn enumerate_amd_adapters() -> windows::core::Result<Vec<WinGpuAdapter>> {
     enumerate_by_vendor(AMD_VENDOR_ID)
 }
 
+/// First AMD hardware adapter handle (for D3D12 device creation / GPA).
+#[cfg_attr(not(feature = "gpa"), allow(dead_code))]
+pub fn first_amd_adapter_handle() -> windows::core::Result<IDXGIAdapter1> {
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }?;
+    for index in 0.. {
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
+        if desc.VendorId == AMD_VENDOR_ID && desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            return Ok(adapter);
+        }
+    }
+    Err(windows::core::Error::from_win32())
+}
+
 pub fn enumerate_by_vendor(vendor_id: u32) -> windows::core::Result<Vec<WinGpuAdapter>> {
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }?;
     let mut out = Vec::new();
 
     for index in 0.. {
-        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else { break };
-        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else { continue };
+        let Ok(adapter) = (unsafe { factory.EnumAdapters1(index) }) else {
+            break;
+        };
+        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            continue;
+        };
 
         if desc.VendorId != vendor_id {
             continue;
@@ -38,7 +62,11 @@ pub fn enumerate_by_vendor(vendor_id: u32) -> windows::core::Result<Vec<WinGpuAd
             continue;
         }
 
-        let len = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        let len = desc
+            .Description
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(desc.Description.len());
         out.push(WinGpuAdapter {
             description: String::from_utf16_lossy(&desc.Description[..len]),
             vendor_id: desc.VendorId,
