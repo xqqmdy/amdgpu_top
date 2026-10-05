@@ -16,6 +16,10 @@ pub struct WinGpuAdapter {
     pub dedicated_system_memory: u64,
     /// bytes, ≈ GTT/shared total
     pub shared_system_memory: u64,
+    /// DXGI_ADAPTER_DESC::SubSysId
+    pub sub_sys_id: u32,
+    /// DXGI_ADAPTER_DESC::Revision (PCI revision id)
+    pub revision: u32,
 }
 
 pub const AMD_VENDOR_ID: u32 = 0x1002;
@@ -76,6 +80,8 @@ pub fn enumerate_by_vendor(vendor_id: u32) -> windows::core::Result<Vec<WinGpuAd
             dedicated_video_memory: desc.DedicatedVideoMemory as u64,
             dedicated_system_memory: desc.DedicatedSystemMemory as u64,
             shared_system_memory: desc.SharedSystemMemory as u64,
+            sub_sys_id: unsafe { adapter.GetDesc() }.map(|d| d.SubSysId).unwrap_or(0),
+            revision: unsafe { adapter.GetDesc() }.map(|d| d.Revision).unwrap_or(0),
         });
     }
 

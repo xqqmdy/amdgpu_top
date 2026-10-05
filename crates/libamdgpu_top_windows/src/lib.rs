@@ -118,6 +118,9 @@ pub struct AdapterSnapshot {
     pub description: String,
     pub vendor_id: u32,
     pub device_id: u32,
+    /// PCI revision id (DXGI_ADAPTER_DESC::Revision)
+    pub revision: u32,
+    pub sub_sys_id: u32,
     /// `{HighPart:0x..}_{LowPart:0x..}`
     pub luid: String,
     pub vram_total_kib: u64,
@@ -140,6 +143,12 @@ pub struct AdapterSnapshot {
     /// ADLX sensors when the `adlx` feature is enabled and the driver provides them
     #[cfg(feature = "adlx")]
     pub sensors: Option<SensorSnapshot>,
+    /// ADLX supported ranges (static, y-axis bounds for sensor plots)
+    #[cfg(feature = "adlx")]
+    pub sensors_range: Option<adlx::SensorRange>,
+    /// ADLX static device identity for the Device Info side panel
+    #[cfg(feature = "adlx")]
+    pub device_info: Option<adlx::AdlxDeviceInfo>,
 }
 
 pub struct Sampler {
@@ -194,8 +203,11 @@ impl Sampler {
             adapter_mem.iter().map(|a| (a.luid, a)).collect();
 
         #[cfg(feature = "adlx")]
-        let adlx_snap: Vec<crate::SensorSnapshot> =
-            self.adlx.as_mut().map(|a| a.snapshot()).unwrap_or_default();
+        #[cfg(feature = "adlx")]
+        let (adlx_snap, adlx_ranges, adlx_infos) = match self.adlx.as_mut() {
+            Some(a) => (a.snapshot(), a.ranges(), a.device_infos()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
+        };
 
         let mut proc_names = proc::get_process_names();
 
@@ -303,6 +315,8 @@ impl Sampler {
                     description: a.description.clone(),
                     vendor_id: a.vendor_id,
                     device_id: a.device_id,
+                    revision: a.revision,
+                    sub_sys_id: a.sub_sys_id,
                     luid: format!("0x{:08X}_0x{:08X}", a.luid_high as u32, a.luid_low),
                     vram_total_kib: a.dedicated_video_memory / 1024,
                     shared_total_kib: a.shared_system_memory / 1024,
@@ -316,6 +330,10 @@ impl Sampler {
                     shared_resident_device_bytes: dev.map_or(0, |d| d.non_local_resident_bytes),
                     #[cfg(feature = "adlx")]
                     sensors: adlx_snap.get(idx).cloned(),
+                    #[cfg(feature = "adlx")]
+                    sensors_range: adlx_ranges.get(idx).copied(),
+                    #[cfg(feature = "adlx")]
+                    device_info: adlx_infos.get(idx).cloned(),
                 }
             })
             .collect()

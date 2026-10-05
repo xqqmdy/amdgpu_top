@@ -12,19 +12,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use eframe::egui;
-use egui_plot::{Legend, Line, Plot};
-use libamdgpu_top_windows::{AdapterSnapshot, Sampler, SnapshotArgs};
+use egui_plot::{Axis, AxisHints, Legend, Line, Plot};
+use libamdgpu_top_windows::{AdapterSnapshot, EngineUsage, Sampler, SnapshotArgs};
 #[cfg(any(feature = "adlx", feature = "gpa"))]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "adlx")]
 use libamdgpu_top_windows::SensorSnapshot;
 
 const MAX_SAMPLES: usize = 240;
+
+// Layout constants copied from the Linux GUI (crates/amdgpu_top_gui/src/app.rs).
+const SPACING: [f32; 2] = [16.0; 2];
+const SENSORS_HEIGHT: f32 = 96.0;
+const SENSORS_WIDTH: f32 = SENSORS_HEIGHT * 4.0;
+const FDINFO_LIST_HEIGHT: f32 = 208.0;
+const PLOT_HEIGHT: f32 = 208.0;
+const PLOT_WIDTH: f32 = PLOT_HEIGHT * 5.0;
 
 // ---------------------------------------------------------------------------
 // worker
@@ -49,15 +57,75 @@ struct SampleRecord {
     s: Option<SensorSnapshot>,
 }
 
+/// Per-tick total engine usage sample (mirrors fdinfo_history).
+struct EngineHistRecord {
+    idx: f64,
+    u: EngineUsage,
+}
+
+/// Collapsible section, Linux-GUI style.
+fn collapsing(ui: &mut egui::Ui, title: &str, default_open: bool, add: impl FnOnce(&mut egui::Ui)) {
+    egui::CollapsingHeader::new(title)
+        .default_open(default_open)
+        .show(ui, add);
+}
+
+/// One sensor mini-plot cell: title with live value + filled line, y-axis
+/// pinned to the ADLX-supported range (usage range is 0-100, matching the
+/// Linux GUI's include_y(0)/include_y(100) percent plots). Axes are shown
+/// with the x axis formatted as relative seconds.
+#[cfg_attr(not(any(feature = "adlx", feature = "gpa")), allow(dead_code))]
+fn sensor_plot(
+    ui: &mut egui::Ui,
+    id: &str,
+    label: &str,
+    val: Option<f64>,
+    unit: &str,
+    range: Option<(f64, f64)>,
+    points: Vec<[f64; 2]>,
+) {
+    let (min, max) = range.unwrap_or((0.0, 100.0));
+
+    egui::Grid::new(id).spacing(SPACING).show(ui, |ui| {
+        match val {
+            Some(v) => ui.label(format!("{label} ({v:4.0} {unit})")),
+            None => ui.label(label),
+        };
+        ui.end_row();
+
+        let line = egui_plot::Line::new(id, points).fill(0.0_f32);
+        let hover_unit = unit.to_string();
+        egui_plot::Plot::new(id)
+            .allow_zoom(false)
+            .allow_drag(false)
+            .allow_scroll(false)
+            .include_y(min)
+            .include_y(max)
+            .custom_x_axes(vec![time_x_axis()])
+            .label_formatter(move |_, v| format!("{:.1}s\n{:.1} {hover_unit}", v.x, v.y))
+            .height(SENSORS_HEIGHT)
+            .width(SENSORS_WIDTH)
+            .show(ui, |p| p.line(line));
+    });
+}
+
+/// Shared x axis hints: ticks in relative seconds (plot x = seconds since
+/// app start, like the Linux GUI's vec_plotpoint x).
+fn time_x_axis() -> AxisHints<'static> {
+    AxisHints::new(Axis::X).formatter(|mark, _| format!("{:.0}s", mark.value))
+}
+
 /// VRAM history sample (always collected, like the Linux GUI's vram_history)
 struct VramRecord {
     idx: f64,
-    /// Σ per-process resident local bytes
+    /// Σ per-process resident local bytes (user-attributable subset)
     resident: u64,
-    /// Σ per-process committed dedicated bytes
-    commit: u64,
-    /// Σ per-process resident non-local bytes
-    shared: u64,
+    /// adapter-level dedicated commit (Task Manager / ADLX GPUVRAM semantics)
+    device_commit: u64,
+    /// adapter-level resident VRAM (physical footprint)
+    device_resident: u64,
+    /// adapter-level resident non-local bytes
+    device_shared: u64,
     /// adapter totals, bytes
     vram_total: u64,
     shared_total: u64,
@@ -66,10 +134,13 @@ struct VramRecord {
 struct DeviceUi {
     description: String,
     device_id: u32,
+    revision_id: u32,
     luid: String,
     last: Option<AdapterSnapshot>,
+    /// plot x value: seconds since app start (shared time axis)
     sample_idx: f64,
     vram_history: std::collections::VecDeque<VramRecord>,
+    engine_history: std::collections::VecDeque<EngineHistRecord>,
     #[cfg(feature = "adlx")]
     history: VecDeque<SampleRecord>,
 }
@@ -79,8 +150,9 @@ impl DeviceUi {
         self.vram_history.push_back(VramRecord {
             idx: self.sample_idx,
             resident: dev.vram_resident_used_bytes,
-            commit: dev.vram_commit_used_bytes,
-            shared: dev.shared_resident_used_bytes,
+            device_commit: dev.vram_commit_device_bytes,
+            device_resident: dev.vram_resident_device_bytes,
+            device_shared: dev.shared_resident_device_bytes,
             vram_total: dev.vram_total_kib * 1024,
             shared_total: dev.shared_total_kib * 1024,
         });
@@ -96,6 +168,8 @@ struct App {
     devices: Vec<DeviceUi>,
     selected: usize,
     interval_ms: Arc<AtomicU64>,
+    /// shared time origin for plot x values (GPA history included)
+    start: Instant,
     #[cfg(feature = "gpa")]
     gpa: GpaState,
 }
@@ -112,31 +186,20 @@ enum GpaState {
     },
 }
 
+/// One GPA capture sample; values are aligned with the counters vector
+/// received alongside (per-counter mini-plot grid).
 #[cfg(feature = "gpa")]
 struct CounterRecord {
     idx: f64,
-    gpu: f64,
-    cs: f64,
-    tex: f64,
-    mem: f64,
+    values: Vec<f64>,
 }
 
 #[cfg(feature = "gpa")]
 impl CounterRecord {
     fn from_counters(idx: f64, counters: &[libamdgpu_top_windows::gpa::SpmCounter]) -> Self {
-        let get = |name: &str| {
-            counters
-                .iter()
-                .find(|c| c.name == name)
-                .map(|c| c.mean)
-                .unwrap_or(f64::NAN)
-        };
         Self {
             idx,
-            gpu: get("GPUBusy"),
-            cs: get("CSBusy"),
-            tex: get("TexUnitBusy"),
-            mem: get("MemUnitBusy"),
+            values: counters.iter().map(|c| c.mean).collect(),
         }
     }
 }
@@ -149,6 +212,7 @@ impl App {
             devices: Vec::new(),
             selected: 0,
             interval_ms,
+            start: Instant::now(),
             #[cfg(feature = "gpa")]
             gpa: GpaState::Waiting,
         }
@@ -170,7 +234,7 @@ impl App {
                         GpaState::Live { history, .. } => history,
                         _ => VecDeque::new(),
                     };
-                    let idx = history.back().map(|r| r.idx + 1.0).unwrap_or(1.0);
+                    let idx = self.start.elapsed().as_secs_f64();
                     history.push_back(CounterRecord::from_counters(idx, &counters));
                     while history.len() > MAX_SAMPLES {
                         history.pop_front();
@@ -178,13 +242,22 @@ impl App {
                     self.gpa = GpaState::Live { counters, history };
                 }
                 Msg::Snap(snap) => {
+                    let t = self.start.elapsed().as_secs_f64();
                     for (i, dev) in snap.iter().enumerate() {
                         if let Some(slot) = self.devices.get_mut(i) {
                             slot.description = dev.description.clone();
                             slot.device_id = dev.device_id;
+                            slot.revision_id = dev.revision;
                             slot.luid = dev.luid.clone();
-                            slot.sample_idx += 1.0;
+                            slot.sample_idx = t;
                             slot.push_vram(dev);
+                            slot.engine_history.push_back(EngineHistRecord {
+                                idx: slot.sample_idx,
+                                u: dev.total_usage.clone(),
+                            });
+                            while slot.engine_history.len() > MAX_SAMPLES {
+                                slot.engine_history.pop_front();
+                            }
                             #[cfg(feature = "adlx")]
                             {
                                 slot.history.push_back(SampleRecord {
@@ -200,10 +273,12 @@ impl App {
                             let mut slot = DeviceUi {
                                 description: dev.description.clone(),
                                 device_id: dev.device_id,
+                                revision_id: dev.revision,
                                 luid: dev.luid.clone(),
                                 last: Some(dev.clone()),
-                                sample_idx: 1.0,
+                                sample_idx: t,
                                 vram_history: std::collections::VecDeque::new(),
+                                engine_history: std::collections::VecDeque::new(),
                                 #[cfg(feature = "adlx")]
                                 history: VecDeque::new(),
                             };
@@ -229,25 +304,6 @@ impl App {
 // ---------------------------------------------------------------------------
 // plots helpers
 // ---------------------------------------------------------------------------
-
-#[cfg(feature = "adlx")]
-fn series(
-    history: &VecDeque<SampleRecord>,
-    get: impl Fn(&SensorSnapshot) -> Option<f64>,
-) -> Vec<[f64; 2]> {
-    history
-        .iter()
-        .filter_map(|r| get(r.s.as_ref()?).map(|v| [r.idx, v]))
-        .collect()
-}
-
-#[cfg_attr(not(feature = "adlx"), allow(dead_code))]
-fn fmt_opt(v: Option<f64>, unit: &str) -> String {
-    match v {
-        Some(v) => format!("{v:.1}{unit}"),
-        None => "-".into(),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // eframe App
@@ -304,6 +360,20 @@ impl eframe::App for App {
             });
         });
 
+        // Device Info side panel (Linux GUI equivalent, static fields).
+        // Default width fits the longest row on one unwrapped line; the user
+        // can still resize (egui then remembers the manual size). The panel
+        // must not be shown before the first snapshot: egui stores the panel
+        // size on every frame it is shown, so an early empty frame would pin
+        // the fallback width in PanelState and shadow the fitted default.
+        if let Some(dev) = self.devices.get(self.selected) {
+            let panel_w = device_info_panel_width(ctx, dev);
+            egui::SidePanel::left("device_info")
+                .default_width(panel_w)
+                .resizable(true)
+                .show(ctx, |ui| device_info_section(ui, dev));
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(f) = &self.fatal {
                 ui.colored_label(egui::Color32::RED, f);
@@ -315,19 +385,21 @@ impl eframe::App for App {
             };
             let Some(snap) = &dev.last else { return };
 
-            // single page, all sections stacked vertically (like the Linux GUI)
+            // single page, all sections stacked vertically (like the Linux GUI);
+            // Sensors last (Linux GUI puts sensor plots after the process list)
             egui::ScrollArea::vertical().show(ui, |ui| {
-                sensors_section(ui, dev, snap);
-                ui.add_space(8.0);
-                utilization_section(ui, snap);
-                ui.add_space(8.0);
+                activity_section(ui, dev);
                 #[cfg(feature = "gpa")]
-                hardware_counters_section(ui, &self.gpa);
-                #[cfg(feature = "gpa")]
+                {
+                    ui.add_space(8.0);
+                    hardware_counters_section(ui, &self.gpa);
+                }
                 ui.add_space(8.0);
                 vram_section(ui, dev, snap);
                 ui.add_space(8.0);
-                processes_section(ui, snap);
+                processes_section(ui, dev, snap);
+                ui.add_space(8.0);
+                sensors_section(ui, dev, snap);
             });
         });
     }
@@ -337,188 +409,427 @@ impl eframe::App for App {
 // sections (single page)
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(not(feature = "adlx"), allow(unused_variables))]
-fn sensors_section(ui: &mut egui::Ui, dev: &DeviceUi, snap: &AdapterSnapshot) {
-    ui.heading("Sensors");
+/// Sidebar width that keeps the longest Device Info row on a single
+/// unwrapped line: the widest key+value pair measured with the body font,
+/// plus item spacing, panel margins, collapsing-body indent, a vertical
+/// scrollbar allowance and a small safety margin for the bold key labels.
+fn device_info_panel_width(ctx: &egui::Context, dev: &DeviceUi) -> f32 {
+    let style = ctx.style();
+    let font = egui::TextStyle::Body.resolve(&style);
+    let text_w = |s: &str| {
+        ctx.fonts_mut(|f| {
+            f.layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                .size()
+                .x
+        })
+    };
 
-    #[cfg(not(feature = "adlx"))]
-    {
-        ui.label(
-            egui::RichText::new(
-                "ADLX sensor panel requires the 'adlx' feature:\n  cargo build -p amdgpu_top_gui_windows --features adlx",
-            )
-            .weak(),
-        );
-    }
+    let mut w = 0.0_f32;
+    let mut row = |k: &str, v: String| {
+        w = w.max(text_w(k) + text_w(&v));
+    };
+
+    row("Device Name", dev.description.clone());
+    row(
+        "DID : RID",
+        format!("0x{:04X} : 0x{:02X}", dev.device_id, dev.revision_id),
+    );
+    row("LUID", dev.luid.clone());
 
     #[cfg(feature = "adlx")]
-    {
-        match &snap.sensors {
-            Some(s) => {
-                egui::Grid::new("sensor_now").num_columns(4).show(ui, |ui| {
-                    let row = |ui: &mut egui::Ui, k: &str, v: Option<f64>, unit: &str| {
-                        ui.strong(k);
-                        ui.monospace(fmt_opt(v, unit));
-                    };
-                    row(ui, "GPU usage", s.gpu_usage, " %");
-                    row(ui, "GPU clock", s.gpu_clock_mhz, " MHz");
-                    row(ui, "VRAM clock", s.vram_clock_mhz, " MHz");
-                    ui.end_row();
-                    row(ui, "Temp (edge)", s.temp_edge_c, " °C");
-                    row(ui, "Temp (hotspot)", s.temp_hotspot_c, " °C");
-                    row(ui, "Fan", s.fan_rpm, " RPM");
-                    ui.end_row();
-                    row(ui, "Board power", s.total_board_power_w, " W");
-                    row(ui, "Chip power", s.power_w, " W");
-                    row(ui, "Voltage", s.voltage_mv, " mV");
-                    ui.end_row();
-                    row(ui, "VRAM used (ADLX)", s.vram_used_mb, " MB");
-                    ui.label("");
-                    ui.label("");
-                    ui.end_row();
-                });
+    if let Some(info) = dev.last.as_ref().and_then(|s| s.device_info.as_ref()) {
+        row(
+            "SubSystem",
+            format!(
+                "0x{} (vendor 0x{})",
+                info.subsystem_id, info.subsystem_vendor_id
+            ),
+        );
+        row("Unique ID", info.unique_id.to_string());
+        row(
+            "VRAM",
+            format!("{} MB ({})", info.total_vram_mb, info.vram_type),
+        );
+        row("VBIOS PN", info.vbios_pn.clone());
+        row("VBIOS Ver", info.vbios_version.clone());
+        row("VBIOS Date", info.vbios_date.clone());
+    }
 
-                ui.add_space(4.0);
-                let hist = &dev.history;
-                plot(
-                    ui,
-                    "p_temp",
-                    vec![
-                        ("edge °C", series(hist, |s| s.temp_edge_c)),
-                        ("hotspot °C", series(hist, |s| s.temp_hotspot_c)),
-                    ],
-                );
-                plot(
-                    ui,
-                    "p_clk",
-                    vec![
-                        ("GPU MHz", series(hist, |s| s.gpu_clock_mhz)),
-                        ("VRAM MHz", series(hist, |s| s.vram_clock_mhz)),
-                    ],
-                );
-                plot(
-                    ui,
-                    "p_pow",
-                    vec![
-                        ("board W", series(hist, |s| s.total_board_power_w)),
-                        ("fan ÷10 RPM", series(hist, |s| s.fan_rpm.map(|v| v / 10.0))),
-                    ],
-                );
+    let spacing = &style.spacing;
+    w + spacing.item_spacing.x
+        + spacing.indent
+        + (spacing.window_margin.left + spacing.window_margin.right) as f32
+        + 28.0
+}
+
+/// Device Info side panel — static identity (DXGI + ADLX where the
+/// feature is enabled). Linux-GUI fields with no Windows source (chip class,
+/// CU counts, caches, gfx_target_version, IP discovery) are omitted.
+fn device_info_section(ui: &mut egui::Ui, dev: &DeviceUi) {
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        collapsing(ui, "Device Info", true, |ui| {
+            // Wrapping rows instead of a Grid on purpose: a Grid sizes its
+            // columns to the intrinsic (unwrapped) text width, so long values
+            // (device name, VBIOS strings) kept the content rect wider than
+            // the panel. On egui 0.33 the painted resize separator tracks the
+            // content rect while the drag strip tracks the panel rect (fixed
+            // upstream in egui #8056), which broke sidebar resizing.
+            let row = |ui: &mut egui::Ui, k: &str, v: String| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(k);
+                    ui.label(v);
+                });
+            };
+            row(ui, "Device Name", dev.description.clone());
+            row(
+                ui,
+                "DID : RID",
+                format!("0x{:04X} : 0x{:02X}", dev.device_id, dev.revision_id),
+            );
+            row(ui, "LUID", dev.luid.clone());
+
+            #[cfg(feature = "adlx")]
+            if let Some(snap) = &dev.last {
+                if let Some(info) = &snap.device_info {
+                    row(
+                        ui,
+                        "SubSystem",
+                        format!(
+                            "0x{} (vendor 0x{})",
+                            info.subsystem_id, info.subsystem_vendor_id
+                        ),
+                    );
+                    row(ui, "Unique ID", info.unique_id.to_string());
+                    row(
+                        ui,
+                        "VRAM",
+                        format!("{} MB ({})", info.total_vram_mb, info.vram_type),
+                    );
+                    row(ui, "VBIOS PN", info.vbios_pn.clone());
+                    row(ui, "VBIOS Ver", info.vbios_version.clone());
+                    row(ui, "VBIOS Date", info.vbios_date.clone());
+                }
             }
-            None => {
+        });
+    });
+}
+
+/// Sensors — per-metric mini-plots in a two-column grid, mirroring the
+/// Linux GUI's style (label with live value + percent-in-range, filled line,
+/// y-axis pinned to the ADLX-supported range). Temperature plots use the
+/// range max as the critical reference.
+#[cfg_attr(not(feature = "adlx"), allow(unused_variables))]
+fn sensors_section(ui: &mut egui::Ui, dev: &DeviceUi, snap: &AdapterSnapshot) {
+    collapsing(ui, "Sensors", true, |ui| {
+        #[cfg(not(feature = "adlx"))]
+        {
+            ui.label(
+                egui::RichText::new(
+                    "ADLX sensor panel requires the 'adlx' feature:\n  cargo build -p amdgpu_top_gui_windows --features adlx",
+                )
+                .weak(),
+            );
+        }
+
+        #[cfg(feature = "adlx")]
+        {
+            let Some(s) = &snap.sensors else {
                 ui.label(
                     egui::RichText::new(
                         "ADLX sensors unavailable for this adapter (shadow adapter or driver without ADLX).",
                     )
                     .weak(),
                 );
-            }
+                return;
+            };
+
+            let hist = &dev.history;
+            let series = |get: &dyn Fn(&SensorSnapshot) -> Option<f64>| -> Vec<[f64; 2]> {
+                hist.iter()
+                    .filter_map(|r| get(r.s.as_ref()?).map(|v| [r.idx, v]))
+                    .collect()
+            };
+
+            // (grid slot id, label, live value, unit, range, series)
+            let mut items: Vec<(
+                &str,
+                &str,
+                Option<f64>,
+                &str,
+                Option<(f64, f64)>,
+                Vec<[f64; 2]>,
+            )> = Vec::new();
+            let r = snap.sensors_range;
+
+            items.push((
+                "s_clk",
+                "GPU Clock",
+                s.gpu_clock_mhz,
+                "MHz",
+                r.as_ref().and_then(|r| r.gpu_clock_mhz),
+                series(&|s| s.gpu_clock_mhz),
+            ));
+            items.push((
+                "s_mclk",
+                "VRAM Clock",
+                s.vram_clock_mhz,
+                "MHz",
+                r.as_ref().and_then(|r| r.vram_clock_mhz),
+                series(&|s| s.vram_clock_mhz),
+            ));
+            items.push((
+                "s_volt",
+                "Voltage",
+                s.voltage_mv,
+                "mV",
+                r.as_ref().and_then(|r| r.voltage_mv),
+                series(&|s| s.voltage_mv),
+            ));
+            items.push((
+                "s_bpw",
+                "Board Power",
+                s.total_board_power_w,
+                "W",
+                r.as_ref().and_then(|r| r.total_board_power_w),
+                series(&|s| s.total_board_power_w),
+            ));
+            items.push((
+                "s_pw",
+                "Chip Power",
+                s.power_w,
+                "W",
+                r.as_ref().and_then(|r| r.power_w),
+                series(&|s| s.power_w),
+            ));
+            items.push((
+                "s_fan",
+                "Fan",
+                s.fan_rpm,
+                "RPM",
+                r.as_ref().and_then(|r| r.fan_rpm),
+                series(&|s| s.fan_rpm),
+            ));
+            items.push((
+                "s_usage",
+                "GPU Usage",
+                s.gpu_usage,
+                "%",
+                r.as_ref().and_then(|r| r.gpu_usage),
+                series(&|s| s.gpu_usage),
+            ));
+            items.push((
+                "s_vrammb",
+                "VRAM Used",
+                s.vram_used_mb,
+                "MB",
+                r.as_ref().and_then(|r| r.vram_mb),
+                series(&|s| s.vram_used_mb),
+            ));
+
+            let mut n = 1usize;
+            egui::Grid::new("sensors_grid")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    for (id, label, val, unit, range, pts) in items {
+                        if val.is_none() && pts.is_empty() {
+                            continue;
+                        }
+                        sensor_plot(ui, id, label, val, unit, range, pts);
+                        if n % 2 == 0 {
+                            ui.end_row();
+                        }
+                        n += 1;
+                    }
+                    if n % 2 == 0 {
+                        ui.end_row();
+                    }
+                });
+
+            // temperatures (range max == critical reference)
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("Temperatures").small().weak());
+            let mut n = 1usize;
+            egui::Grid::new("temp_grid").num_columns(2).show(ui, |ui| {
+                for (id, label, val, range) in [
+                    (
+                        "t_edge",
+                        "Edge Temp",
+                        s.temp_edge_c,
+                        r.as_ref().and_then(|r| r.temp_edge_c),
+                    ),
+                    (
+                        "t_hot",
+                        "Junction Temp",
+                        s.temp_hotspot_c,
+                        r.as_ref().and_then(|r| r.temp_hotspot_c),
+                    ),
+                    ("t_intake", "Intake Temp", s.temp_intake_c, None),
+                ] {
+                    if val.is_none() {
+                        continue;
+                    }
+                    let pts = series(&match id {
+                        "t_edge" => |s: &SensorSnapshot| s.temp_edge_c,
+                        "t_hot" => |s: &SensorSnapshot| s.temp_hotspot_c,
+                        _ => |s: &SensorSnapshot| s.temp_intake_c,
+                    });
+                    let rng = range.or(Some((0.0, 110.0)));
+                    sensor_plot(ui, id, label, val, "C", rng, pts);
+                    if n % 2 == 0 {
+                        ui.end_row();
+                    }
+                    n += 1;
+                }
+                if n % 2 == 0 {
+                    ui.end_row();
+                }
+            });
         }
-    }
+    });
 }
 
 /// Hardware IP busy counters via GPUPerfAPI (first AMD adapter).
 /// Values come from a slow blocking sampler thread (one capture takes
 /// seconds: multi-pass + built-in Clear workload), so they refresh at
 /// their own pace, independent of the PDH snapshot interval.
+/// Hardware Counters (GPUPerfAPI) — per-counter mini-plots in a
+/// two-column grid, mirroring the Linux GUI's GRBM/GRBM2 section style.
+/// Values come from a slow blocking sampler thread (one capture takes
+/// seconds: multi-pass + built-in Clear workload), so they refresh at
+/// their own pace, independent of the PDH snapshot interval.
 #[cfg(feature = "gpa")]
 fn hardware_counters_section(ui: &mut egui::Ui, gpa: &GpaState) {
-    ui.heading("Hardware Counters (GPUPerfAPI)");
-    ui.label(
-        egui::RichText::new(
-            "device-global HW counters, first AMD adapter · window = built-in workload (self-load inflates GPU-busy-class counters)",
-        )
-        .small()
-        .weak(),
-    );
-    ui.add_space(4.0);
+    collapsing(ui, "Hardware Counters (GPUPerfAPI)", true, |ui| {
+        ui.label(
+            egui::RichText::new(
+                "device-global HW counters, first AMD adapter · window = built-in workload (self-load inflates GPU-busy-class counters) · pipeline-stage granularity, not GRBM IP bits",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
 
-    match gpa {
-        GpaState::Waiting => {
-            ui.spinner();
-        }
-        GpaState::InitFailed(e) => {
-            ui.label(
-                egui::RichText::new(format!(
-                    "GPUPerfAPI unavailable: {e}\nGPUPerfAPIDX12-x64.dll from the GPA release zip must be on the path (or set AMDGPU_TOP_GPA_DLL)."
-                ))
-                .weak(),
-            );
-        }
-        GpaState::Live { counters, history } => {
-            egui::Grid::new("gpa_counters")
-                .num_columns(2)
-                .striped(true)
-                .show(ui, |ui| {
-                    for c in counters {
-                        ui.strong(&c.name);
-                        ui.add(
-                            egui::ProgressBar::new((c.mean.clamp(0.0, 100.0) / 100.0) as f32)
-                                .text(format!("{:.2}%", c.mean))
-                                .desired_width(200.0),
+        match gpa {
+            GpaState::Waiting => {
+                ui.spinner();
+            }
+            GpaState::InitFailed(e) => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "GPUPerfAPI unavailable: {e}\nGPUPerfAPIDX12-x64.dll from the GPA release zip must be on the path (or set AMDGPU_TOP_GPA_DLL)."
+                    ))
+                    .weak(),
+                );
+            }
+            GpaState::Live { counters, history } => {
+                let mut n = 1usize;
+                egui::Grid::new("gpa_grid").num_columns(2).show(ui, |ui| {
+                    for (i, c) in counters.iter().enumerate() {
+                        let pts: Vec<[f64; 2]> = history
+                            .iter()
+                            .filter_map(|r| r.values.get(i).map(|v| [r.idx, *v]))
+                            .collect();
+                        sensor_plot(
+                            ui,
+                            &format!("gpa_{i}"),
+                            &c.name,
+                            Some(c.mean),
+                            "%",
+                            Some((0.0, 100.0)),
+                            pts,
                         );
+                        if n % 2 == 0 {
+                            ui.end_row();
+                        }
+                        n += 1;
+                    }
+                    if n % 2 == 0 {
                         ui.end_row();
                     }
                 });
-
-            ui.add_space(4.0);
-            let line = |get: &dyn Fn(&CounterRecord) -> f64| -> Vec<[f64; 2]> {
-                history.iter().map(|r| [r.idx, get(r)]).collect()
-            };
-            plot(
-                ui,
-                "gpa_busy",
-                vec![
-                    ("GPUBusy %", line(&|r| r.gpu)),
-                    ("CSBusy %", line(&|r| r.cs)),
-                    ("TexUnitBusy %", line(&|r| r.tex)),
-                    ("MemUnitBusy %", line(&|r| r.mem)),
-                ],
-            );
+            }
         }
-    }
-}
-
-fn utilization_section(ui: &mut egui::Ui, snap: &AdapterSnapshot) {
-    ui.heading("Utilization");
-    let u = &snap.total_usage;
-
-    egui::Grid::new("util").num_columns(6).show(ui, |ui| {
-        let bar = |ui: &mut egui::Ui, name: &str, v: f64| {
-            ui.strong(name);
-            ui.add(
-                egui::ProgressBar::new((v.clamp(0.0, 100.0) / 100.0) as f32)
-                    .text(format!("{v:.1}%"))
-                    .desired_width(140.0),
-            );
-            ui.end_row();
-        };
-        bar(ui, "GFX", u.gfx);
-        bar(ui, "Compute", u.compute);
-        bar(ui, "Copy", u.dma);
-        bar(ui, "Decode", u.dec);
-        bar(ui, "Encode", u.enc);
-        bar(ui, "VideoProc", u.media);
     });
 }
 
-fn processes_section(ui: &mut egui::Ui, snap: &AdapterSnapshot) {
-    ui.heading("Processes");
-    let rows: Vec<_> = snap
-        .processes
-        .iter()
-        .filter(|p| p.usage.total() > 0.05 || p.vram_resident_bytes > 10 * 1048576)
-        .collect();
+fn activity_section(ui: &mut egui::Ui, dev: &DeviceUi) {
+    collapsing(ui, "Activity", true, |ui| {
+        let Some(snap) = &dev.last else { return };
+        let u = &snap.total_usage;
+        let media = u.dec + u.enc + u.media;
 
-    if rows.is_empty() {
-        ui.label("(no active processes)");
-        return;
-    }
+        let hist = &dev.engine_history;
+        let line = |get: &dyn Fn(&EngineUsage) -> f64| -> Vec<[f64; 2]> {
+            hist.iter().map(|r| [r.idx, get(&r.u)]).collect()
+        };
 
-    egui::ScrollArea::vertical()
-        .max_height(280.0)
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
+        egui::Grid::new("util").num_columns(3).show(ui, |ui| {
+            let bar = |ui: &mut egui::Ui, name: &str, v: f64| {
+                ui.strong(name);
+                ui.add(
+                    egui::ProgressBar::new((v.clamp(0.0, 100.0) / 100.0) as f32)
+                        .text(format!("{v:.1}%"))
+                        .desired_width(140.0),
+                );
+                ui.end_row();
+            };
+            bar(ui, "GFX", u.gfx);
+            bar(ui, "Media (dec+enc+vpp)", media);
+            bar(ui, "Copy", u.dma);
+        });
+
+        ui.add_space(4.0);
+        plot(
+            ui,
+            "activity_plot",
+            "Engine usage history",
+            vec![
+                ("GFX %", line(&|u| u.gfx)),
+                ("Compute %", line(&|u| u.compute)),
+                ("Copy %", line(&|u| u.dma)),
+                ("Media %", line(&|u| u.dec + u.enc + u.media)),
+            ],
+        );
+    });
+}
+
+fn processes_section(ui: &mut egui::Ui, dev: &DeviceUi, snap: &AdapterSnapshot) {
+    collapsing(ui, "Processes", true, |ui| {
+        // per-engine totals plot (Linux GUI's fdinfo plot equivalent)
+        let hist = &dev.engine_history;
+        let line = |get: &dyn Fn(&EngineUsage) -> f64| -> Vec<[f64; 2]> {
+            hist.iter().map(|r| [r.idx, get(&r.u)]).collect()
+        };
+        plot(
+            ui,
+            "engine_plot",
+            "Engine usage history",
+            vec![
+                ("GFX %", line(&|u| u.gfx)),
+                ("Compute %", line(&|u| u.compute)),
+                ("Copy %", line(&|u| u.dma)),
+                ("Decode %", line(&|u| u.dec)),
+                ("Encode %", line(&|u| u.enc)),
+                ("VideoProc %", line(&|u| u.media)),
+            ],
+        );
+        ui.add_space(6.0);
+
+        let rows: Vec<_> = snap
+            .processes
+            .iter()
+            .filter(|p| p.usage.total() > 0.05 || p.vram_resident_bytes > 10 * 1048576)
+            .collect();
+
+        if rows.is_empty() {
+            ui.label("(no active processes)");
+            return;
+        }
+
+        // Linux GUI layout (egui_grid_fdinfo): short lists expand fully,
+        // long lists get a two-axis scroll area with FDINFO_LIST_HEIGHT.
+        let proc_len = rows.len();
+        let show_procs = |ui: &mut egui::Ui| {
             egui::Grid::new("procs")
                 .num_columns(11)
                 .striped(true)
@@ -553,110 +864,151 @@ fn processes_section(ui: &mut egui::Ui, snap: &AdapterSnapshot) {
                         ui.end_row();
                     }
                 });
-        });
+        };
+
+        if proc_len < 8 {
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, false])
+                .show(ui, show_procs);
+        } else {
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .min_scrolled_height(FDINFO_LIST_HEIGHT)
+                .show(ui, show_procs);
+        }
+    });
 }
 
 fn vram_section(ui: &mut egui::Ui, dev: &DeviceUi, snap: &AdapterSnapshot) {
-    ui.heading("VRAM");
-    let total = (snap.vram_total_kib as f64) * 1024.0;
+    collapsing(ui, "VRAM", true, |ui| {
+        let total = (snap.vram_total_kib as f64) * 1024.0;
 
-    // usage bars on top; the bar itself spans 60% of the available width
-    let bar_width = ui.available_width() * 0.6;
-    let bar = |ui: &mut egui::Ui, label: &str, used: f64| {
-        ui.label(label);
-        ui.add(
-            egui::ProgressBar::new(if total > 0.0 {
-                (used / total).clamp(0.0, 1.0)
-            } else {
-                0.0
-            } as f32)
-            .text(format!(
-                "{:.2} GiB / {:.2} GiB",
-                used / 1073741824.0,
-                total / 1073741824.0
-            ))
-            .desired_width(bar_width),
+        // usage bars on top; the bar itself spans 30% of the available width.
+        // Bars use adapter-level (device-global) accounting — the same figures as
+        // Task Manager's "Dedicated GPU memory" and ADLX GPUVRAM. Per-process sums
+        // (bottom text line) only cover user-attributable residency and are
+        // always lower: kernel/driver/display-pipeline residency is not attributed
+        // to any process (same gap as Σ fdinfo-resident vs vram used on Linux).
+        let bar_width = ui.available_width() * 0.3;
+        let bar = |ui: &mut egui::Ui, label: &str, used: f64, total: f64| {
+            ui.label(label);
+            ui.add(
+                egui::ProgressBar::new(if total > 0.0 {
+                    (used / total).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                } as f32)
+                .text(format!(
+                    "{:5.0} / {:5.0} MiB",
+                    used / 1048576.0,
+                    total / 1048576.0
+                ))
+                .desired_width(bar_width),
+            );
+        };
+
+        bar(
+            ui,
+            "Dedicated (device commit — Task Manager / ADLX semantics):",
+            snap.vram_commit_device_bytes as f64,
+            total,
         );
-    };
+        bar(
+            ui,
+            "Dedicated (device resident — physical footprint):",
+            snap.vram_resident_device_bytes as f64,
+            total,
+        );
 
-    bar(
-        ui,
-        "Resident (Σ per-process — real footprint, replay buffers excluded):",
-        snap.vram_resident_used_bytes as f64,
-    );
-    bar(
-        ui,
-        "Committed (includes evictable driver buffers, e.g. ReLive replay):",
-        snap.vram_commit_used_bytes as f64,
-    );
+        let s_total = (snap.shared_total_kib as f64) * 1024.0;
+        bar(
+            ui,
+            "Shared (device resident non-local):",
+            snap.shared_resident_device_bytes as f64,
+            s_total,
+        );
 
-    let s_total = (snap.shared_total_kib as f64) * 1024.0;
-    let s_used = snap.shared_resident_used_bytes as f64;
-    ui.label("Shared GPU memory (resident non-local):");
-    ui.add(
-        egui::ProgressBar::new(if s_total > 0.0 {
-            (s_used / s_total).clamp(0.0, 1.0)
-        } else {
-            0.0
-        } as f32)
-        .text(format!(
-            "{:.2} GiB / {:.2} GiB",
-            s_used / 1073741824.0,
-            s_total / 1073741824.0
-        ))
-        .desired_width(bar_width),
-    );
+        ui.label(
+            egui::RichText::new(format!(
+                "Σ per-process: resident {} MiB · commit {} MiB (user-attributable subset)",
+                snap.vram_resident_used_bytes / 1048576,
+                snap.vram_commit_used_bytes / 1048576,
+            ))
+            .small()
+            .weak(),
+        );
 
-    // history plot below, always expanded
-    ui.add_space(4.0);
-    let hist = &dev.vram_history;
-    let max_mib = hist
-        .iter()
-        .map(|r| r.vram_total.max(r.shared_total) as f64 / 1048576.0)
-        .last()
-        .unwrap_or(0.0);
-    let line = |get: &dyn Fn(&VramRecord) -> f64| -> Vec<[f64; 2]> {
-        hist.iter().map(|r| [r.idx, get(r)]).collect()
-    };
-    Plot::new("vram_plot")
-        .allow_scroll(false)
-        .include_y(max_mib)
-        .height(110.0)
-        .width(ui.available_width())
-        .legend(Legend::default())
-        .show(ui, |p| {
-            p.line(Line::new(
-                "VRAM (resident)",
-                line(&|r| r.resident as f64 / 1048576.0),
-            ));
-            p.line(Line::new(
-                "VRAM (commit)",
-                line(&|r| r.commit as f64 / 1048576.0),
-            ));
-            p.line(Line::new(
-                "GTT (shared)",
-                line(&|r| r.shared as f64 / 1048576.0),
-            ));
+        // collapsible history plot below the bars
+        ui.add_space(4.0);
+        let hist = &dev.vram_history;
+        let max_mib = hist
+            .iter()
+            .map(|r| r.vram_total.max(r.shared_total) as f64 / 1048576.0)
+            .last()
+            .unwrap_or(0.0);
+        let line = |get: &dyn Fn(&VramRecord) -> f64| -> Vec<[f64; 2]> {
+            hist.iter().map(|r| [r.idx, get(r)]).collect()
+        };
+        let mib = |v: u64| v as f64 / 1048576.0;
+        collapsing(ui, "VRAM history", true, |ui| {
+            Plot::new("vram_plot")
+                .allow_scroll(false)
+                .include_y(max_mib)
+                .height(PLOT_HEIGHT)
+                .width(PLOT_WIDTH.min(ui.available_width()))
+                .legend(Legend::default())
+                .custom_x_axes(vec![time_x_axis()])
+                .label_formatter(|name, v| format!("{:.1}s : {name} {:.0} MiB", v.x, v.y))
+                .show(ui, |p| {
+                    p.line(Line::new(
+                        "VRAM commit (device)",
+                        line(&|r| mib(r.device_commit)),
+                    ));
+                    p.line(Line::new(
+                        "VRAM resident (device)",
+                        line(&|r| mib(r.device_resident)),
+                    ));
+                    p.line(Line::new(
+                        "VRAM resident (Σ proc)",
+                        line(&|r| mib(r.resident)),
+                    ));
+                    p.line(Line::new(
+                        "GTT shared (device)",
+                        line(&|r| mib(r.device_shared)),
+                    ));
+                });
         });
+    });
 }
 
 // ---------------------------------------------------------------------------
 // plot widget
 // ---------------------------------------------------------------------------
 
+/// Multi-line percent plot (activity / per-engine fdinfo usage), collapsible
+/// via its header: y pinned to 0-100 like the Linux GUI's percent plots, x in
+/// seconds with a time tooltip.
 #[cfg_attr(not(feature = "adlx"), allow(dead_code))]
-fn plot(ui: &mut egui::Ui, id: &str, lines: Vec<(&str, Vec<[f64; 2]>)>) {
-    Plot::new(id)
-        .legend(Legend::default())
-        .height(110.0)
-        .allow_drag(false)
-        .allow_zoom(false)
-        .allow_scroll(false)
-        .show(ui, |pui| {
-            for (name, pts) in lines {
-                pui.line(Line::new(name, pts));
-            }
-        });
+fn plot(ui: &mut egui::Ui, id: &str, title: &str, lines: Vec<(&str, Vec<[f64; 2]>)>) {
+    collapsing(ui, title, true, |ui| {
+        Plot::new(id)
+            .legend(Legend::default())
+            .height(PLOT_HEIGHT)
+            .width(PLOT_WIDTH.min(ui.available_width()))
+            .allow_drag(false)
+            .allow_zoom(false)
+            .allow_scroll(false)
+            .include_y(0.0)
+            .include_y(100.0)
+            .auto_bounds([false, false])
+            .custom_x_axes(vec![time_x_axis()])
+            .label_formatter(|name, v| format!("{:.1}s : {name} {:.1}%", v.x, v.y))
+            .show(ui, |pui| {
+                for (name, pts) in lines {
+                    pui.line(Line::new(name, pts));
+                }
+            });
+    });
 }
 
 fn main() -> eframe::Result<()> {
@@ -713,7 +1065,6 @@ fn main() -> eframe::Result<()> {
             };
             eprintln!("[gpa-gui] sampler ready, collecting...");
             loop {
-                // ~200 ms/pass sampling window (TDR-safe; see SpmSampler::collect)
                 match sampler.collect() {
                     Ok(counters) if !counters.is_empty() => {
                         if tx_gpa.send(Msg::GpaCounters(counters)).is_err() {
