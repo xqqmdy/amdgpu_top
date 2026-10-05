@@ -106,10 +106,10 @@ fn render_table(out: &mut impl Write, snapshot: &[AdapterSnapshot], interval_ms:
         )?;
         writeln!(
             out,
-            "  VRAM (dedicated) total {} MiB | shared total {} MiB | used(Σproc): {} MiB dedicated",
+            "  VRAM total {} MiB | resident(Σproc) {} MiB | commit(Σproc) {} MiB",
             mib(dev.vram_total_kib),
-            mib(dev.shared_total_kib),
-            mib_bytes(dev.dedicated_used_bytes),
+            mib_bytes(dev.vram_resident_used_bytes),
+            mib_bytes(dev.vram_commit_used_bytes),
         )?;
         let t = &dev.total_usage;
         writeln!(
@@ -142,7 +142,7 @@ fn render_table(out: &mut impl Write, snapshot: &[AdapterSnapshot], interval_ms:
         let rows: Vec<&ProcGpuUsage> = dev
             .processes
             .iter()
-            .filter(|p| show_all || p.usage.total() > 0.05 || p.dedicated_bytes > 10 * 1048576)
+            .filter(|p| show_all || p.usage.total() > 0.05 || p.vram_resident_bytes > 10 * 1048576)
             .collect();
 
         if rows.is_empty() {
@@ -152,19 +152,20 @@ fn render_table(out: &mut impl Write, snapshot: &[AdapterSnapshot], interval_ms:
 
         writeln!(
             out,
-            "  {:>7}  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>10} {:>10}",
-            "PID", "NAME", "GFX%", "COMP%", "COPY%", "DEC%", "ENC%", "VPP%", "DED(MiB)", "SHR(MiB)"
+            "  {:>7}  {:<24} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>10} {:>10} {:>10}",
+            "PID", "NAME", "GFX%", "COMP%", "COPY%", "DEC%", "ENC%", "VPP%", "VRAM(MiB)", "COMMIT(MiB)", "SHR(MiB)"
         )?;
         for p in rows {
             let u = &p.usage;
             writeln!(
                 out,
-                "  {:>7}  {:<24} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>10} {:>10}",
+                "  {:>7}  {:<24} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>6.1} {:>10} {:>10} {:>10}",
                 p.pid,
                 truncate(&p.name, 24),
                 u.gfx, u.compute, u.dma, u.dec, u.enc, u.media,
-                mib_bytes(p.dedicated_bytes),
-                mib_bytes(p.shared_bytes),
+                mib_bytes(p.vram_resident_bytes),
+                mib_bytes(p.vram_commit_bytes),
+                mib_bytes(p.shared_resident_bytes),
             )?;
         }
         writeln!(out)?;

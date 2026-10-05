@@ -28,9 +28,15 @@ pub struct EngineSample {
 pub struct ProcMemSample {
     pub pid: u32,
     pub luid: Option<(u32, u32)>,
-    /// dedicated (VRAM) commit, bytes — PDH "GPU Process Memory" values are bytes
-    pub dedicated_bytes: u64,
-    pub shared_bytes: u64,
+    /// committed dedicated (VRAM), bytes — includes evictable driver buffers
+    /// like ReLive replay (~10 GiB on AMDRSServ but ~0 resident)
+    pub dedicated_commit_bytes: u64,
+    /// committed shared memory, bytes
+    pub shared_commit_bytes: u64,
+    /// resident local (VRAM) bytes — "Local Usage", ≈ drm-resident-vram
+    pub local_resident_bytes: u64,
+    /// resident non-local (system/shared) bytes — "Non Local Usage"
+    pub non_local_resident_bytes: u64,
 }
 
 /// u32 PDH status code: 0 == ERROR_SUCCESS
@@ -121,6 +127,28 @@ pub struct GpuPdhQuery {
     engine_counter: PDH_HCOUNTER,
     proc_mem_dedicated: PDH_HCOUNTER,
     proc_mem_shared: PDH_HCOUNTER,
+    proc_mem_local: PDH_HCOUNTER,
+    proc_mem_non_local: PDH_HCOUNTER,
+    /// adapter-level dedicated commit (Task Manager "Dedicated GPU memory")
+    adapter_dedicated: PDH_HCOUNTER,
+    /// adapter-level resident VRAM (physical footprint)
+    adapter_local: PDH_HCOUNTER,
+    /// adapter-level resident shared (non-local) memory
+    adapter_non_local: PDH_HCOUNTER,
+}
+
+/// Adapter-level memory sample (device-global accounting; the difference to
+/// the per-process sums is kernel/driver/display-pipeline residency plus
+/// evictable-but-committed segments).
+/// Instance names: `luid_0x<high32>_0x<low32>_phys_N[_part_M]`.
+pub struct AdapterMemSample {
+    pub luid: (u32, u32),
+    /// adapter dedicated commit, bytes
+    pub dedicated_commit_bytes: u64,
+    /// adapter resident VRAM, bytes
+    pub local_resident_bytes: u64,
+    /// adapter resident non-local, bytes
+    pub non_local_resident_bytes: u64,
 }
 
 impl GpuPdhQuery {
@@ -134,6 +162,11 @@ impl GpuPdhQuery {
         let mut engine_counter = PDH_HCOUNTER::default();
         let mut proc_mem_dedicated = PDH_HCOUNTER::default();
         let mut proc_mem_shared = PDH_HCOUNTER::default();
+        let mut proc_mem_local = PDH_HCOUNTER::default();
+        let mut proc_mem_non_local = PDH_HCOUNTER::default();
+        let mut adapter_dedicated = PDH_HCOUNTER::default();
+        let mut adapter_local = PDH_HCOUNTER::default();
+        let mut adapter_non_local = PDH_HCOUNTER::default();
 
         let mut fail = 0;
         if !ok(unsafe {
@@ -145,18 +178,45 @@ impl GpuPdhQuery {
         if !ok(unsafe {
             PdhAddEnglishCounterW(query, w!(r"\GPU Process Memory(*)\Shared Usage"), 0, &mut proc_mem_shared)
         }) { fail = 4; }
+        if !ok(unsafe {
+            PdhAddEnglishCounterW(query, w!(r"\GPU Process Memory(*)\Local Usage"), 0, &mut proc_mem_local)
+        }) { fail = 5; }
+        if !ok(unsafe {
+            PdhAddEnglishCounterW(query, w!(r"\GPU Process Memory(*)\Non Local Usage"), 0, &mut proc_mem_non_local)
+        }) { fail = 6; }
+        if !ok(unsafe {
+            PdhAddEnglishCounterW(query, w!(r"\GPU Adapter Memory(*)\Dedicated Usage"), 0, &mut adapter_dedicated)
+        }) { fail = 7; }
+        if !ok(unsafe {
+            PdhAddEnglishCounterW(query, w!(r"\GPU Local Adapter Memory(*)\Local Usage"), 0, &mut adapter_local)
+        }) { fail = 8; }
+        if !ok(unsafe {
+            PdhAddEnglishCounterW(query, w!(r"\GPU Non Local Adapter Memory(*)\Non Local Usage"), 0, &mut adapter_non_local)
+        }) { fail = 9; }
 
         if fail != 0 {
             unsafe { PdhCloseQuery(query) };
             return Err(WinError::from_hresult(windows::core::HRESULT::from_win32(fail)));
         }
 
-        Ok(Self { query, engine_counter, proc_mem_dedicated, proc_mem_shared })
+        Ok(Self {
+            query,
+            engine_counter,
+            proc_mem_dedicated,
+            proc_mem_shared,
+            proc_mem_local,
+            proc_mem_non_local,
+            adapter_dedicated,
+            adapter_local,
+            adapter_non_local,
+        })
     }
 
     /// Collect one PDH sample. Utilization is a rate counter and only yields
     /// values from the second collect onwards.
-    pub fn collect(&mut self) -> Result<(Vec<EngineSample>, Vec<ProcMemSample>), u32> {
+    pub fn collect(
+        &mut self,
+    ) -> Result<(Vec<EngineSample>, Vec<ProcMemSample>, Vec<AdapterMemSample>), u32> {
         let status = unsafe { PdhCollectQueryData(self.query) };
         if !ok(status) {
             return Err(status);
@@ -178,32 +238,65 @@ impl GpuPdhQuery {
         }
         let engines = collapsed.into_values().collect();
 
-        // GPU Process Memory
-        let mut dedicated: HashMap<u32, (Option<(u32, u32)>, u64)> = HashMap::new();
-        for (name, v) in read_counter_array(self.proc_mem_dedicated)? {
-            let (pid, luid) = parse_instance(&name);
-            let e = dedicated.entry(pid).or_insert((luid, 0));
-            e.1 = v as u64;
-            if e.0.is_none() { e.0 = luid; }
-        }
+        // GPU Process Memory (all instant counters, bytes)
+        let mut per_pid: HashMap<u32, ProcMemSample> = HashMap::new();
+        let mut feed = |counter: PDH_HCOUNTER, put: &dyn Fn(&mut ProcMemSample, u64)| -> Result<(), u32> {
+            for (name, v) in read_counter_array(counter)? {
+                let (pid, luid) = parse_instance(&name);
+                let e = per_pid.entry(pid).or_insert_with(|| ProcMemSample {
+                    pid,
+                    luid,
+                    dedicated_commit_bytes: 0,
+                    shared_commit_bytes: 0,
+                    local_resident_bytes: 0,
+                    non_local_resident_bytes: 0,
+                });
+                put(e, v as u64);
+                if e.luid.is_none() { e.luid = luid; }
+            }
+            Ok(())
+        };
 
-        let mut shared: HashMap<u32, u64> = HashMap::new();
-        for (name, v) in read_counter_array(self.proc_mem_shared)? {
-            let (pid, _) = parse_instance(&name);
-            shared.insert(pid, v as u64);
-        }
+        feed(self.proc_mem_local, &|e, v| e.local_resident_bytes = v)?;
+        feed(self.proc_mem_non_local, &|e, v| e.non_local_resident_bytes = v)?;
+        feed(self.proc_mem_dedicated, &|e, v| e.dedicated_commit_bytes = v)?;
+        feed(self.proc_mem_shared, &|e, v| e.shared_commit_bytes = v)?;
 
-        let proc_mem = dedicated
-            .into_iter()
-            .map(|(pid, (luid, dedicated_bytes))| ProcMemSample {
-                pid,
-                luid,
-                dedicated_bytes,
-                shared_bytes: shared.get(&pid).copied().unwrap_or(0),
-            })
-            .collect();
+        let proc_mem: Vec<ProcMemSample> = per_pid.into_values().collect();
 
-        Ok((engines, proc_mem))
+        // Adapter-level memory (dedicated commit / local resident / non-local resident).
+        // Instances are luid-keyed with optional _part_N suffixes (linked adapters);
+        // parts are summed into one sample per LUID.
+        let mut per_luid: HashMap<(u32, u32), AdapterMemSample> = HashMap::new();
+        let mut feed_adapter =
+            |counter: PDH_HCOUNTER, put: &dyn Fn(&mut AdapterMemSample, u64)| -> Result<(), u32> {
+                for (name, v) in read_counter_array(counter)? {
+                    let (pid, luid) = parse_instance(&name);
+                    // adapter instance names have no pid segment (parse yields 0)
+                    let Some(luid) = luid else { continue };
+                    let e = per_luid.entry(luid).or_insert_with(|| AdapterMemSample {
+                        luid,
+                        dedicated_commit_bytes: 0,
+                        local_resident_bytes: 0,
+                        non_local_resident_bytes: 0,
+                    });
+                    put(e, v as u64);
+                    let _ = pid;
+                }
+                Ok(())
+            };
+
+        feed_adapter(self.adapter_dedicated, &|e, v| {
+            e.dedicated_commit_bytes = v.max(e.dedicated_commit_bytes)
+        })?;
+        feed_adapter(self.adapter_local, &|e, v| e.local_resident_bytes += v)?;
+        feed_adapter(self.adapter_non_local, &|e, v| {
+            e.non_local_resident_bytes += v
+        })?;
+
+        let adapter_mem: Vec<AdapterMemSample> = per_luid.into_values().collect();
+
+        Ok((engines, proc_mem, adapter_mem))
     }
 }
 
