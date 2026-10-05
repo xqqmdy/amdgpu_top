@@ -245,10 +245,10 @@ fn spm_main(interval_ms: u64) {
 
     loop {
         let start = Instant::now();
-        match sampler.collect(20_000) {
+        match sampler.collect() {
             Ok(counters) if !counters.is_empty() => {
                 println!("{CSI_CLEAR}");
-                println!("SPM hardware counters (GPUPerfAPI)  window ~{interval_ms} ms");
+                println!("SPM hardware counters (GPUPerfAPI)  zero-workload ~500 ms/pass window");
                 println!();
                 println!(
                     "  {:<26} {:>12} {:>12} {:>8}",

@@ -16,6 +16,9 @@ default = []
 # Sensor panel (temperature/clock/fan/power) via ADLX; requires the local
 # GPUOpen ADLX clone (see libamdgpu_top_windows).
 adlx = ["libamdgpu_top_windows/adlx"]
+# Hardware IP busy counters (GPUBusy/CSBusy/...) via GPUPerfAPI; requires
+# GPUPerfAPIDX12-x64.dll (see libamdgpu_top_windows).
+gpa = ["libamdgpu_top_windows/gpa"]
 
 [dependencies]
 libamdgpu_top_windows = { path = "../libamdgpu_top_windows" }

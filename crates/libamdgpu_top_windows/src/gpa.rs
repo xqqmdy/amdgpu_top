@@ -21,11 +21,8 @@ use windows::core::{Interface, PCWSTR};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12CreateDevice, ID3D12CommandAllocator, ID3D12CommandQueue, ID3D12Device, ID3D12Fence,
-    ID3D12GraphicsCommandList, ID3D12Resource, D3D12_COMMAND_LIST_TYPE_DIRECT,
-    D3D12_COMMAND_QUEUE_DESC, D3D12_DESCRIPTOR_HEAP_DESC, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-    D3D12_FENCE_FLAG_NONE, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT,
-    D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET,
+    ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
+    D3D12_FENCE_FLAG_NONE,
 };
 use windows::Win32::Graphics::Dxgi::IDXGIAdapter1;
 
@@ -50,6 +47,7 @@ type GpaBeginCommandListFn =
     unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut *mut c_void) -> GpaStatus;
 type GpaEndCommandListFn = unsafe extern "system" fn(*mut c_void) -> GpaStatus;
 type GpaBeginSampleFn = unsafe extern "system" fn(u32, *mut c_void) -> GpaStatus;
+type GpaContinueSampleFn = unsafe extern "system" fn(u32, *mut c_void) -> GpaStatus;
 type GpaEndSampleFn = unsafe extern "system" fn(*mut c_void) -> GpaStatus;
 type GpaGetSampleResultSizeFn =
     unsafe extern "system" fn(*mut c_void, u32, *mut usize) -> GpaStatus;
@@ -111,6 +109,7 @@ pub struct GpaApi {
     begin_command_list: GpaBeginCommandListFn,
     end_command_list: GpaEndCommandListFn,
     begin_sample: GpaBeginSampleFn,
+    continue_sample: GpaContinueSampleFn,
     end_sample: GpaEndSampleFn,
     get_sample_result_size: GpaGetSampleResultSizeFn,
     get_sample_result: GpaGetSampleResultFn,
@@ -184,6 +183,7 @@ impl GpaApi {
                 begin_command_list: std::mem::transmute(sym!("GpaBeginCommandList")),
                 end_command_list: std::mem::transmute(sym!("GpaEndCommandList")),
                 begin_sample: std::mem::transmute(sym!("GpaBeginSample")),
+                continue_sample: std::mem::transmute(sym!("GpaContinueSampleOnCommandList")),
                 end_sample: std::mem::transmute(sym!("GpaEndSample")),
                 get_sample_result_size: std::mem::transmute(sym!("GpaGetSampleResultSize")),
                 get_sample_result: std::mem::transmute(sym!("GpaGetSampleResult")),
@@ -248,13 +248,17 @@ struct D3d12Ctx {
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
+    /// second command list for the sample-end half (the sample spans two
+    /// submissions; GPA requires a separate BeginCommandList per list)
+    allocator2: ID3D12CommandAllocator,
+    list2: ID3D12GraphicsCommandList,
+    /// completion fence (submission tracking)
     fence: ID3D12Fence,
     fence_value: u64,
-    /// small render target + RTV for the sampling workload (Clear loop)
-    /// kept alive while its RTV is in use
-    #[allow(dead_code)]
-    rt_resource: Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource>,
-    rtv_heap: Option<windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap>,
+    /// delay fence: the queue waits on it to hold the sampling window open
+    /// with zero GPU workload (no Clear/render commands at all)
+    delay_fence: ID3D12Fence,
+    delay_seq: u64,
 }
 
 impl D3d12Ctx {
@@ -275,77 +279,71 @@ impl D3d12Ctx {
             // CreateCommandList returns an open (recording) list; close it so
             // that later Reset works (empty list, never submitted).
             list.Close()?;
+
             let fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
 
-            // Small render target + RTV for the sampling workload.
-            let rtv_heap: windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap = device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                    NumDescriptors: 1,
-                    ..Default::default()
-                })?;
-            let heap_start = rtv_heap.GetCPUDescriptorHandleForHeapStart();
-            let mut rt_resource: Option<ID3D12Resource> = None;
-            device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_NONE,
-                &D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                    Width: 1024,
-                    Height: 1024,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
-                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
-                    ..Default::default()
-                },
-                D3D12_RESOURCE_STATE_RENDER_TARGET,
-                None,
-                &mut rt_resource,
-            )?;
-            let rt_resource = rt_resource.unwrap();
-            device.CreateRenderTargetView(&rt_resource, None, heap_start);
+            let allocator2 = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+            let list2: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator2, None)?;
+            list2.Close()?;
+
+            let delay_fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
 
             Ok(Self {
                 device,
                 queue,
                 allocator,
                 list,
+                allocator2,
+                list2,
                 fence,
                 fence_value: 0,
-                rt_resource: Some(rt_resource),
-                rtv_heap: Some(rtv_heap),
+                delay_fence,
+                delay_seq: 0,
             })
         }
     }
 
-    fn rtv(&self) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE> {
-        self.rtv_heap
-            .as_ref()
-            .map(|h| unsafe { h.GetCPUDescriptorHandleForHeapStart() })
+    /// Record with |f| on list #1, submit, wait for completion.
+    fn submit<F: FnOnce(&Self)>(&mut self, f: F) -> windows::core::Result<()> {
+        let v = self.record_submit(0, f)?;
+        self.wait_gpu(v);
+        Ok(())
     }
 
-    /// Record with |f| on a fresh command list, submit, wait on fence.
-    fn submit<F: FnOnce(&Self)>(&mut self, f: F) -> windows::core::Result<()> {
+    /// Record with |f| on list #2, submit without waiting — for the
+    /// sample-end half, which queues behind a queue-level GPU wait.
+    fn submit_no_wait<F: FnOnce(&Self)>(&mut self, f: F) -> windows::core::Result<u64> {
+        self.record_submit(1, f)
+    }
+
+    /// Spin until the completion fence reaches |value|.
+    fn wait_gpu(&self, value: u64) {
+        while unsafe { self.fence.GetCompletedValue() } < value {
+            std::hint::spin_loop();
+        }
+    }
+
+    fn record_submit<F: FnOnce(&Self)>(&mut self, which: u8, f: F) -> windows::core::Result<u64> {
         unsafe {
-            self.allocator.Reset()?;
-            self.list.Reset(&self.allocator, None)?;
+            if which == 0 {
+                self.allocator.Reset()?;
+                self.list.Reset(&self.allocator, None)?;
+            } else {
+                self.allocator2.Reset()?;
+                self.list2.Reset(&self.allocator2, None)?;
+            }
             f(self);
-            self.list.Close()?;
-            self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+            if which == 0 {
+                self.list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(self.list.cast()?)]);
+            } else {
+                self.list2.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(self.list2.cast()?)]);
+            }
             self.fence_value += 1;
             self.queue.Signal(&self.fence, self.fence_value)?;
-            while self.fence.GetCompletedValue() < self.fence_value {
-                std::hint::spin_loop();
-            }
-            Ok(())
+            Ok(self.fence_value)
         }
     }
 }
@@ -376,7 +374,9 @@ pub struct SpmSampler {
 /// Busy-percentage public counters available on gfx10+ (names from GPA's
 /// public counter tables; presence is queried at runtime).
 pub const BUSY_COUNTERS: &[&str] = &[
-    "GPUBusy",
+    // NOTE: "GPUBusy" is excluded — with the zero-load window (queue held by
+    // a GPU wait), the pending-wait state keeps its underlying counter
+    // asserted, so it reads a constant 100% while every other counter is 0.
     "TessellatorBusy",
     "VsGsBusy",
     "PreTessellationBusy",
@@ -511,21 +511,23 @@ impl SpmSampler {
         }
     }
 
-    /// Run one capture, returning per-counter values.
+    /// Run one zero-workload capture.
     ///
-    /// Officially-supported discrete flow: one sample wraps a small built-in
-    /// GPU workload (a Clear-render-target loop) inside a single command list:
-    ///   begin_session
-    ///     [cl] begin_command_list > begin_sample(0)
-    ///          > OMSetRenderTargets + Clear x N   (sampling window)
-    ///          > end_sample > end_command_list > submit
-    ///   end_session > GpaGetSampleResult
+    /// The sampling window is held open by a queue-level GPU wait: BeginSample
+    /// executes immediately, the queue then blocks on `delay_fence` (queue
+    /// .Wait), the sample-end command list sits queued behind the wait, the
+    /// CPU sleeps WINDOW_MS, then a CPU-side fence signal releases EndSample.
+    /// The GPU issues NO work of ours during the window — the device-global
+    /// hardware counters only accumulate other processes' activity.
     ///
-    /// The hardware counters are device-global, so while our own workload
-    /// keeps the counter window open, other processes' activity also
-    /// accumulates into the counts (verified: CSBusy rises when an unrelated
-    /// compute workload runs, though this process has no shaders at all).
-    pub fn collect(&mut self, clears: u32) -> Result<Vec<SpmCounter>, String> {
+    /// TDR constraint: the queued (pending) EndSample batch must complete
+    /// well under Windows' ~2 s TDR timeout, so the window is capped at
+    /// 500 ms per pass (earlier 2 s variants tripped TDR resets = desktop
+    /// freezes; GPU-workload windows are banned entirely per user report).
+    pub fn collect(&mut self) -> Result<Vec<SpmCounter>, String> {
+        /// sampling window per pass; keep << 2 s TDR threshold
+        const WINDOW_MS: u64 = 500;
+
         unsafe {
             const SAMPLE_ID: u32 = 0;
 
@@ -556,20 +558,18 @@ impl SpmSampler {
             let session = self.session;
             let api = &self.api;
 
-            // Multiple counters may require multiple passes; the sample must
-            // exist in every pass (GPA multi-pass scheduling).
             let mut n_passes = 1u32;
             self.api.check(
                 (self.api.get_pass_count)(session, &mut n_passes),
                 "GpaGetPassCount",
             )?;
-            eprintln!("[gpa] passes required: {n_passes}");
 
             for pass in 0..n_passes {
-                let mut workload: Result<(), String> = Ok(());
+                // cl1: open the sample (executes immediately, tiny batch).
+                let mut phase1: Result<(), String> = Ok(());
                 self.ctx
                     .submit(|ctx| {
-                        workload = (|| -> Result<(), String> {
+                        phase1 = (|| -> Result<(), String> {
                             let mut cl: *mut c_void = std::ptr::null_mut();
                             api.check(
                                 (api.begin_command_list)(
@@ -582,23 +582,66 @@ impl SpmSampler {
                                 "GpaBeginCommandList",
                             )?;
                             api.check((api.begin_sample)(SAMPLE_ID, cl), "GpaBeginSample")?;
-
-                            // Sampling workload: Clear loop on a 1024x1024 RT.
-                            if let Some(rtv) = ctx.rtv() {
-                                ctx.list.OMSetRenderTargets(1, Some(&rtv), false, None);
-                                let color = [0.5f32, 0.5, 0.5, 1.0];
-                                for _ in 0..clears {
-                                    ctx.list.ClearRenderTargetView(rtv, &color, None);
-                                }
-                            }
-
-                            api.check((api.end_sample)(cl), "GpaEndSample")?;
                             api.check((api.end_command_list)(cl), "GpaEndCommandList")?;
                             Ok(())
                         })();
                     })
-                    .map_err(|e| format!("submit workload: {e}"))?;
-                workload?;
+                    .map_err(|e| format!("submit begin: {e}"))?;
+                phase1?;
+
+                // Block the GPU queue: the window opens with zero workload.
+                self.ctx.delay_seq += 1;
+                let seq = self.ctx.delay_seq;
+                self.ctx
+                    .queue
+                    .Wait(&self.ctx.delay_fence, seq)
+                    .map_err(|e| format!("queue.Wait: {e}"))?;
+
+                // cl2: close the sample, queued behind the GPU wait.
+                let mut phase2: Result<(), String> = Ok(());
+                let done = self
+                    .ctx
+                    .submit_no_wait(|ctx| {
+                        phase2 = (|| -> Result<(), String> {
+                            let mut cl: *mut c_void = std::ptr::null_mut();
+                            api.check(
+                                (api.begin_command_list)(
+                                    session,
+                                    pass,
+                                    ctx.list2.as_raw(),
+                                    GPA_CMDLIST_PRIMARY,
+                                    &mut cl,
+                                ),
+                                "GpaBeginCommandList(end)",
+                            )?;
+                            api.check(
+                                (api.continue_sample)(SAMPLE_ID, cl),
+                                "GpaContinueSampleOnCommandList",
+                            )?;
+                            api.check((api.end_sample)(cl), "GpaEndSample")?;
+                            api.check((api.end_command_list)(cl), "GpaEndCommandList(end)")?;
+                            Ok(())
+                        })();
+                    })
+                    .map_err(|e| format!("submit end: {e}"))?;
+                phase2?;
+
+                // Sampling window: GPU idles on the queue wait; the pending
+                // EndSample batch is ~500 ms, far below the 2 s TDR limit.
+                std::thread::sleep(std::time::Duration::from_millis(WINDOW_MS));
+
+                // Release the queue via the CPU-side fence signal.
+                // (ID3D12CommandQueue::Signal enqueues behind the queued
+                // EndSample — a deadlock ring; ID3D12Fence::Signal is
+                // immediate.)
+                self.ctx
+                    .delay_fence
+                    .Signal(seq)
+                    .map_err(|e| format!("fence.Signal: {e}"))?;
+                self.ctx.wait_gpu(done);
+
+                // Let the queue fully drain between passes.
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
 
             self.api

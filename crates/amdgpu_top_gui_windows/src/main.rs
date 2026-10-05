@@ -14,7 +14,7 @@
 use eframe::egui;
 use egui_plot::{Legend, Line, Plot};
 use libamdgpu_top_windows::{AdapterSnapshot, Sampler, SnapshotArgs};
-#[cfg(feature = "adlx")]
+#[cfg(any(feature = "adlx", feature = "gpa"))]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
@@ -33,6 +33,10 @@ const MAX_SAMPLES: usize = 240;
 enum Msg {
     Snap(Vec<AdapterSnapshot>),
     Fatal(String),
+    #[cfg(feature = "gpa")]
+    GpaInitFailed(String),
+    #[cfg(feature = "gpa")]
+    GpaCounters(Vec<libamdgpu_top_windows::gpa::SpmCounter>),
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +96,49 @@ struct App {
     devices: Vec<DeviceUi>,
     selected: usize,
     interval_ms: Arc<AtomicU64>,
+    #[cfg(feature = "gpa")]
+    gpa: GpaState,
+}
+
+/// GPUPerfAPI hardware counters (first AMD adapter; blocking slow sampler
+/// runs on its own thread, so values arrive at their own pace).
+#[cfg(feature = "gpa")]
+enum GpaState {
+    Waiting,
+    InitFailed(String),
+    Live {
+        counters: Vec<libamdgpu_top_windows::gpa::SpmCounter>,
+        history: VecDeque<CounterRecord>,
+    },
+}
+
+#[cfg(feature = "gpa")]
+struct CounterRecord {
+    idx: f64,
+    gpu: f64,
+    cs: f64,
+    tex: f64,
+    mem: f64,
+}
+
+#[cfg(feature = "gpa")]
+impl CounterRecord {
+    fn from_counters(idx: f64, counters: &[libamdgpu_top_windows::gpa::SpmCounter]) -> Self {
+        let get = |name: &str| {
+            counters
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.mean)
+                .unwrap_or(f64::NAN)
+        };
+        Self {
+            idx,
+            gpu: get("GPUBusy"),
+            cs: get("CSBusy"),
+            tex: get("TexUnitBusy"),
+            mem: get("MemUnitBusy"),
+        }
+    }
 }
 
 impl App {
@@ -102,6 +149,8 @@ impl App {
             devices: Vec::new(),
             selected: 0,
             interval_ms,
+            #[cfg(feature = "gpa")]
+            gpa: GpaState::Waiting,
         }
     }
 
@@ -109,6 +158,25 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Fatal(e) => self.fatal = Some(e),
+                #[cfg(feature = "gpa")]
+                Msg::GpaInitFailed(e) => {
+                    if matches!(self.gpa, GpaState::Waiting) {
+                        self.gpa = GpaState::InitFailed(e);
+                    }
+                }
+                #[cfg(feature = "gpa")]
+                Msg::GpaCounters(counters) => {
+                    let mut history = match std::mem::replace(&mut self.gpa, GpaState::Waiting) {
+                        GpaState::Live { history, .. } => history,
+                        _ => VecDeque::new(),
+                    };
+                    let idx = history.back().map(|r| r.idx + 1.0).unwrap_or(1.0);
+                    history.push_back(CounterRecord::from_counters(idx, &counters));
+                    while history.len() > MAX_SAMPLES {
+                        history.pop_front();
+                    }
+                    self.gpa = GpaState::Live { counters, history };
+                }
                 Msg::Snap(snap) => {
                     for (i, dev) in snap.iter().enumerate() {
                         if let Some(slot) = self.devices.get_mut(i) {
@@ -253,6 +321,10 @@ impl eframe::App for App {
                 ui.add_space(8.0);
                 utilization_section(ui, snap);
                 ui.add_space(8.0);
+                #[cfg(feature = "gpa")]
+                hardware_counters_section(ui, &self.gpa);
+                #[cfg(feature = "gpa")]
+                ui.add_space(8.0);
                 vram_section(ui, dev, snap);
                 ui.add_space(8.0);
                 processes_section(ui, snap);
@@ -341,6 +413,68 @@ fn sensors_section(ui: &mut egui::Ui, dev: &DeviceUi, snap: &AdapterSnapshot) {
                     .weak(),
                 );
             }
+        }
+    }
+}
+
+/// Hardware IP busy counters via GPUPerfAPI (first AMD adapter).
+/// Values come from a slow blocking sampler thread (one capture takes
+/// seconds: multi-pass + built-in Clear workload), so they refresh at
+/// their own pace, independent of the PDH snapshot interval.
+#[cfg(feature = "gpa")]
+fn hardware_counters_section(ui: &mut egui::Ui, gpa: &GpaState) {
+    ui.heading("Hardware Counters (GPUPerfAPI)");
+    ui.label(
+        egui::RichText::new(
+            "device-global HW counters, first AMD adapter · window = built-in workload (self-load inflates GPU-busy-class counters)",
+        )
+        .small()
+        .weak(),
+    );
+    ui.add_space(4.0);
+
+    match gpa {
+        GpaState::Waiting => {
+            ui.spinner();
+        }
+        GpaState::InitFailed(e) => {
+            ui.label(
+                egui::RichText::new(format!(
+                    "GPUPerfAPI unavailable: {e}\nGPUPerfAPIDX12-x64.dll from the GPA release zip must be on the path (or set AMDGPU_TOP_GPA_DLL)."
+                ))
+                .weak(),
+            );
+        }
+        GpaState::Live { counters, history } => {
+            egui::Grid::new("gpa_counters")
+                .num_columns(2)
+                .striped(true)
+                .show(ui, |ui| {
+                    for c in counters {
+                        ui.strong(&c.name);
+                        ui.add(
+                            egui::ProgressBar::new((c.mean.clamp(0.0, 100.0) / 100.0) as f32)
+                                .text(format!("{:.2}%", c.mean))
+                                .desired_width(200.0),
+                        );
+                        ui.end_row();
+                    }
+                });
+
+            ui.add_space(4.0);
+            let line = |get: &dyn Fn(&CounterRecord) -> f64| -> Vec<[f64; 2]> {
+                history.iter().map(|r| [r.idx, get(r)]).collect()
+            };
+            plot(
+                ui,
+                "gpa_busy",
+                vec![
+                    ("GPUBusy %", line(&|r| r.gpu)),
+                    ("CSBusy %", line(&|r| r.cs)),
+                    ("TexUnitBusy %", line(&|r| r.tex)),
+                    ("MemUnitBusy %", line(&|r| r.mem)),
+                ],
+            );
         }
     }
 }
@@ -531,6 +665,8 @@ fn main() -> eframe::Result<()> {
     // worker thread owns the Sampler (PDH/ADLX handles are not Send);
     // tx moves into the thread, rx into the App
     let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+    #[cfg(feature = "gpa")]
+    let tx_gpa = tx.clone();
     let interval2 = Arc::clone(&interval);
     std::thread::spawn(move || {
         let mut sampler = match Sampler::new() {
@@ -551,6 +687,50 @@ fn main() -> eframe::Result<()> {
             }
         }
     });
+
+    // GPUPerfAPI hardware counters: separate thread because the sampler is
+    // !Send AND each capture blocks for seconds (multi-pass + Clear workload).
+    #[cfg(feature = "gpa")]
+    {
+        std::thread::spawn(move || {
+            use libamdgpu_top_windows::gpa::{SpmSampler, BUSY_COUNTERS};
+
+            let names: Vec<String> = BUSY_COUNTERS.iter().map(|s| s.to_string()).collect();
+            let adapter = match libamdgpu_top_windows::dxgi_first_amd_adapter_handle() {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx_gpa.send(Msg::GpaInitFailed(format!("no AMD adapter: {e}")));
+                    return;
+                }
+            };
+            let mut sampler = match SpmSampler::new(adapter, 4096, &names) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[gpa-gui] init failed: {e}");
+                    let _ = tx_gpa.send(Msg::GpaInitFailed(e));
+                    return;
+                }
+            };
+            eprintln!("[gpa-gui] sampler ready, collecting...");
+            loop {
+                // ~200 ms/pass sampling window (TDR-safe; see SpmSampler::collect)
+                match sampler.collect() {
+                    Ok(counters) if !counters.is_empty() => {
+                        if tx_gpa.send(Msg::GpaCounters(counters)).is_err() {
+                            break; // UI closed
+                        }
+                    }
+                    // Empty results (GPU idle window): fall through and retry.
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = tx_gpa.send(Msg::GpaInitFailed(format!("collect failed: {e}")));
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+    }
 
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 860.0]),
