@@ -1,0 +1,24 @@
+[package]
+name = "amdgpu_top_gui_windows"
+license = "MIT"
+description = "Windows GUI for amdgpu_top_win (eframe), backed by libamdgpu_top_windows"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "amdgpu_top_gui_windows"
+path = "src/main.rs"
+
+[features]
+default = []
+# Sensor panel (temperature/clock/fan/power) via ADLX; requires the local
+# GPUOpen ADLX clone (see libamdgpu_top_windows).
+adlx = ["libamdgpu_top_windows/adlx"]
+
+[dependencies]
+libamdgpu_top_windows = { path = "../libamdgpu_top_windows" }
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu"] }
+wgpu = { version = "27", default-features = false, features = ["dx12", "vulkan"] }
+egui_plot = "0.34"
